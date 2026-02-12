@@ -820,19 +820,21 @@ class User : TenantAwareEntity() {
     @Column(nullable = false)
     var email: String = ""
 
-    @Column(nullable = true)                        // STAFF rolü için null (login yapmaz)
+    @Column(nullable = true)                        // STAFF rolü için TENANT_ADMIN şifre belirler (kısıtlı login)
     var passwordHash: String? = null
 
     var phone: String? = null
     var image: String? = null
+    var title: String? = null                        // DÜZELTME AA-E4: Personel unvanı ("Dr.", "Uzm." vb.)
 
     @Enumerated(EnumType.STRING)
     var role: Role = Role.CLIENT
 
     var isActive: Boolean = true
+    var forcePasswordChange: Boolean = false          // DÜZELTME T7: Onboarding'de geçici şifre → ilk girişte değiştirmeli
 
     // Güvenlik: başarısız giriş denemesi sayacı (brute force koruması)
-    // NOT: STAFF için bu alanlar kullanılmaz (login yapmaz)
+    // NOT: STAFF dahil tüm roller için kullanılır (kısıtlı login)
     var failedLoginAttempts: Int = 0
     var lockedUntil: Instant? = null               // DÜZELTME: LocalDateTime → Instant (UTC)
 
@@ -858,15 +860,25 @@ class User : TenantAwareEntity() {
     // Müşteri notları (personel tarafından eklenir)
     @OneToMany(mappedBy = "client", fetch = FetchType.LAZY)
     val notes: MutableList<ClientNote> = mutableListOf()
+
+    // DÜZELTME F1: Personelin sunduğu hizmetler (staff-service ilişkisi)
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+        name = "staff_services",
+        joinColumns = [JoinColumn(name = "staff_id")],
+        inverseJoinColumns = [JoinColumn(name = "service_id")]
+    )
+    val services: MutableSet<Service> = mutableSetOf()
 }
 
 enum class Role {
     PLATFORM_ADMIN,     // Tüm platforma erişim (SaaS sahibi) — Login: ✅
     TENANT_ADMIN,       // İşletme sahibi — tüm tenant verilerine erişim — Login: ✅
-    STAFF,              // Personel — Login: ❌ (şifre yok, JWT yok)
+    STAFF,              // Personel — Login: ✅ (kısıtlı, read-only)
                         //   TENANT_ADMIN tarafından eklenen personel kaydı.
-                        //   Randevu atanması, çalışma saatleri, performans takibi için kullanılır.
-                        //   Admin paneline erişimi YOKTUR.
+                        //   Kendi takvimi ve randevularını görebilir (read-only).
+                        //   Admin, personel adına işlem yapabilir.
+                        //   Refresh token süresi: 7 gün.
     CLIENT              // Müşteri — kendi randevuları, profili — Login: ✅
 }
 
@@ -876,8 +888,8 @@ enum class Role {
 // Alternatif: Ayrı bir platform_admins tablosu oluşturulabilir ancak bu, auth
 // sistemini karmaşıklaştırır. Tek tablo + magic tenant_id daha pragmatiktir.
 
-// NOT: STAFF login YAPMAZ. Sadece TENANT_ADMIN tarafından oluşturulan bir personel
-// profilidir. passwordHash = null olmalıdır. AuthService.login() STAFF girişini engeller.
+// NOT: STAFF kısıtlı login yapar (read-only). TENANT_ADMIN tarafından oluşturulan bir personel
+// profilidir. STAFF de login yapabilir (kısıtlı, read-only). TENANT_ADMIN şifre belirler.
 // TENANT_ADMIN personellerini kendi admin panelinden ekler/düzenler/siler.
 
 // ClientNote.kt — Personel'in müşteri hakkında özel notları
@@ -1047,11 +1059,13 @@ class Service : TenantAwareEntity() {
     @ElementCollection
     @CollectionTable(name = "service_benefits", joinColumns = [JoinColumn(name = "service_id")])
     @Column(name = "benefit")
+    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması (delete+re-insert önlenir)
     var benefits: MutableList<String> = mutableListOf()
 
     @ElementCollection
     @CollectionTable(name = "service_process_steps", joinColumns = [JoinColumn(name = "service_id")])
     @Column(name = "step")
+    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması
     var processSteps: MutableList<String> = mutableListOf()
 
     @Column(columnDefinition = "TEXT")
@@ -1117,14 +1131,16 @@ class Appointment : TenantAwareEntity() {
     @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
 
-    // Müşteri bilgileri
+    // Müşteri bilgileri — Snapshot Pattern (AA-O12):
+    // Hem `client` referansı hem string alanları tutulur. Müşteri bilgisi değişse bile
+    // randevu kaydı oluşturma anındaki bilgiyi korur (fatura/rapor doğruluğu için).
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "client_id")
     var client: User? = null               // Kayıtlı müşteri (nullable: misafir randevu)
 
-    var clientName: String = ""             // Misafir randevular için
-    var clientEmail: String = ""
-    var clientPhone: String = ""
+    var clientName: String = ""             // Snapshot: oluşturma anındaki müşteri adı
+    var clientEmail: String = ""            // Snapshot: oluşturma anındaki e-posta
+    var clientPhone: String = ""            // Snapshot: oluşturma anındaki telefon
 
     // Randevu hizmetleri — Çoklu hizmet desteği (örn: "Saç boyama + Kesim + Fön")
     @OneToMany(mappedBy = "appointment", cascade = [CascadeType.ALL], orphanRemoval = true)
@@ -1178,7 +1194,9 @@ class Appointment : TenantAwareEntity() {
     @UpdateTimestamp
     var updatedAt: Instant? = null                 // DÜZELTME: LocalDateTime → Instant (UTC)
 
-    // Optimistic locking — concurrent update koruması
+    // NOT AA-O5: @Version (optimistic locking) + PESSIMISTIC_WRITE birlikte kullanılıyor.
+    // PESSIMISTIC_WRITE zaten satır seviyesinde kilit alır, @Version gereksiz overhead ekler.
+    // Gelecekte @Version kaldırılabilir — PESSIMISTIC_WRITE tek başına yeterlidir.
     @Version
     var version: Long = 0
 }
@@ -1324,6 +1342,7 @@ class Product : TenantAwareEntity() {
     @ElementCollection
     @CollectionTable(name = "product_features", joinColumns = [JoinColumn(name = "product_id")])
     @Column(name = "feature")
+    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması
     var features: MutableList<String> = mutableListOf()
     var stockQuantity: Int? = null          // null = stok takibi yok
     var lowStockThreshold: Int = 5          // Stok uyarı eşiği
@@ -1361,6 +1380,7 @@ class BlogPost : TenantAwareEntity() {
     @ElementCollection
     @CollectionTable(name = "blog_post_tags", joinColumns = [JoinColumn(name = "blog_post_id")])
     @Column(name = "tag")
+    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması
     var tags: MutableList<String> = mutableListOf()
     var readTime: String = ""
     var isPublished: Boolean = false
@@ -1756,12 +1776,13 @@ class AppointmentService(
                     logger.warn("[tenant={}] Müşteri kara listeye alındı: {} (no-show: {})",
                         tenantId, client.email, client.noShowCount)
                     // Kara liste bildirimi
-                    notificationService.sendClientBlacklistedNotification(client)
+                    val ctx = notificationService.toBlacklistContext(client)
+                    notificationService.sendClientBlacklistedNotification(ctx, client.noShowCount)
                 }
                 userRepository.save(client)
             }
             // No-show bildirimi (TENANT_ADMIN'a)
-            notificationService.sendNoShowNotification(appointment)
+            notificationService.sendNoShowNotification(notificationService.toContext(appointment))
         }
 
         return appointmentRepository.save(appointment)
@@ -1919,11 +1940,14 @@ interface AppointmentRepository : JpaRepository<Appointment, String> {
 
     @Query("""
         SELECT a FROM Appointment a
-        WHERE a.date = :date AND a.startTime <= :time
+        WHERE FUNCTION('TIMESTAMP', a.date, a.startTime) <= FUNCTION('TIMESTAMP', :date, :time)
         AND a.status = :status
         AND (:r24 IS NULL OR a.reminder24hSent = :r24)
         AND (:r1 IS NULL OR a.reminder1hSent = :r1)
     """)
+    /* DÜZELTME K15: Tarih+saat birleşik karşılaştırma. Eski sorgu sadece aynı gündeki
+       randevuları buluyordu. Yeni sorgu TIMESTAMP fonksiyonu ile date+startTime'ı tek
+       datetime olarak karşılaştırır — gece yarısını geçen hesaplamalar doğru çalışır. */
     fun findUpcomingNotReminded(
         @Param("date") date: LocalDate,
         @Param("time") time: LocalTime,
@@ -1957,6 +1981,20 @@ interface AppointmentRepository : JpaRepository<Appointment, String> {
         @Param("cutoffDate") cutoffDate: LocalDate,
         @Param("cutoffTime") cutoffTime: LocalTime
     ): List<Appointment>
+
+    /** DÜZELTME K10: GDPR veri dışa aktarma için — GdprService.exportUserData() tarafından kullanılır */
+    fun findByClientEmail(email: String): List<Appointment>
+
+    /** DÜZELTME F4: Misafir → kayıtlı müşteri eşleştirme — clientId olmayan randevuları bul */
+    fun findByClientEmailAndClientIdIsNull(email: String): List<Appointment>
+
+    /** DÜZELTME K11: GDPR anonimleştirme — clientName → "Anonim", clientEmail → "", clientPhone → "" */
+    @Modifying
+    @Query("""
+        UPDATE Appointment a SET a.clientName = 'Anonim', a.clientEmail = '', a.clientPhone = ''
+        WHERE a.clientEmail = :email
+    """)
+    fun anonymizeByClientEmail(@Param("email") email: String)
 }
 ```
 
@@ -2031,6 +2069,49 @@ interface NotificationTemplateRepository : JpaRepository<NotificationTemplate, S
 // Bildirim log repository — JpaRepository.save() miras alınır
 @Repository
 interface NotificationLogRepository : JpaRepository<NotificationLog, String>
+
+// DÜZELTME K9/AA-E2: ReviewRepository tam tanımı — GdprService, DashboardService tarafından kullanılır
+@Repository
+interface ReviewRepository : JpaRepository<Review, String> {
+    fun findByUserId(userId: String): List<Review>
+    fun findByServiceId(serviceId: String): List<Review>
+    fun findByStaffId(staffId: String): List<Review>
+    fun findByTenantIdAndIsApprovedTrue(tenantId: String, pageable: Pageable): Page<Review>
+    fun countByTenantId(tenantId: String): Long
+    fun averageRatingByTenantId(tenantId: String): Double?
+
+    /** GDPR anonimleştirme — comment → "[Silindi]", rating korunur (istatistiksel veri) */
+    @Modifying
+    @Query("UPDATE Review r SET r.comment = '[Silindi]' WHERE r.client.id = :userId")
+    fun anonymizeByUserId(@Param("userId") userId: String)
+}
+
+// DÜZELTME K11/AA-E3: RefreshTokenRepository tam tanımı — AuthService, GdprService tarafından kullanılır
+@Repository
+interface RefreshTokenRepository : JpaRepository<RefreshToken, String> {
+    fun findByIdAndIsRevokedFalse(id: String): RefreshToken?
+    fun findByFamilyAndIsRevokedFalse(family: String): List<RefreshToken>
+
+    @Modifying
+    @Query("UPDATE RefreshToken rt SET rt.isRevoked = true WHERE rt.family = :family")
+    fun revokeFamily(@Param("family") family: String)
+
+    @Modifying
+    @Query("UPDATE RefreshToken rt SET rt.isRevoked = true WHERE rt.userId = :userId")
+    fun revokeAllByUserId(@Param("userId") userId: String)
+
+    /** DÜZELTME K11: GDPR silme — kullanıcının tüm refresh token'larını sil */
+    fun deleteByUserId(userId: String)
+
+    /** Süresi dolmuş token'ları temizle (scheduled job) */
+    fun deleteByExpiresAtBefore(cutoff: Instant)
+}
+
+// DÜZELTME AA-E12: ServiceCategoryRepository — ServiceCategory CRUD işlemleri
+@Repository
+interface ServiceCategoryRepository : JpaRepository<ServiceCategory, String> {
+    fun findByTenantIdOrderBySortOrderAsc(tenantId: String): List<ServiceCategory>
+}
 ```
 
 ### 5.4 AvailabilityService — Müsait Slot Hesaplama
@@ -2257,7 +2338,7 @@ POST   /api/auth/reset-password              # Token ile şifre sıfırla
 GET    /api/auth/me                          # Mevcut kullanıcı bilgisi
 ```
 
-### 6.3 Admin API (TENANT_ADMIN — STAFF login yapmaz)
+### 6.3 Admin API (TENANT_ADMIN + STAFF kısıtlı login)
 
 ```
 # Dashboard
@@ -2452,6 +2533,10 @@ enum class ErrorCode {
     // Rate Limiting
     RATE_LIMIT_EXCEEDED,          // Çok fazla istek
 
+    // Plan
+    PLAN_LIMIT_EXCEEDED,          // DÜZELTME T2: Plan limiti aşıldı (403 Forbidden)
+    FORBIDDEN,                    // DÜZELTME AA-O9: Genel erişim engeli
+
     // Blacklist
     CLIENT_BLACKLISTED,           // Müşteri kara listede (no-show limit aşıldı)
 
@@ -2523,7 +2608,7 @@ data class AppointmentResponse(
     val createdAt: Instant?
 )
 
-// ── Staff DTO'ları ── (STAFF login yapmaz — oluşturma/güncelleme TENANT_ADMIN tarafından)
+// ── Staff DTO'ları ── (STAFF kısıtlı login (read-only: kendi takvimi) — oluşturma/güncelleme TENANT_ADMIN tarafından)
 
 data class CreateStaffRequest(
     @field:NotBlank val name: String,
@@ -2532,8 +2617,8 @@ data class CreateStaffRequest(
     val image: String? = null,
     val title: String? = null                       // "Uzman Diyetisyen", "Dr.", "Kuaför"
 )
-// NOT: passwordHash alanı YOK — STAFF login yapmaz, şifresi olmaz.
-// Service katmanında: user.passwordHash = null, user.role = Role.STAFF
+// NOT: STAFF için TENANT_ADMIN şifre belirler (CreateStaffRequest'e password alanı eklenmeli).
+// Service katmanında: user.passwordHash = encodedPassword, user.role = Role.STAFF
 
 data class StaffPublicResponse(                     // GET /api/public/staff
     val id: String,
@@ -2632,8 +2717,8 @@ data class TimeSlotResponse(                        // GET /api/public/availabil
 
 ### 7.1 JWT Token Yapısı + Server-Side Revocation
 
-> **Login yapabilen roller:** PLATFORM_ADMIN, TENANT_ADMIN, CLIENT (3 rol)
-> **Login YAPAMAYAN rol:** STAFF — şifresi yok, JWT üretilmez. Sadece TENANT_ADMIN tarafından yönetilen personel kaydıdır.
+> **Login yapabilen roller:** PLATFORM_ADMIN, TENANT_ADMIN, STAFF, CLIENT (4 rol)
+> **STAFF:** Kısıtlı login — read-only erişim (kendi takvimi ve randevuları). TENANT_ADMIN tarafından şifre belirlenir.
 
 ```
 Access Token (1 saat ömür — tüm login yapabilen roller aynı):
@@ -2652,7 +2737,7 @@ Refresh Token (rol bazlı ömür, DB'de saklanır):
   - PLATFORM_ADMIN:  1 gün   (en hassas hesap — kısa ömür)
   - TENANT_ADMIN:   30 gün   (günlük işletme yönetimi)
   - CLIENT:         60 gün   (kullanıcı deneyimi — sık login istenmez)
-  - STAFF:          ❌ Token almaz (login yapmaz)
+  - STAFF:           7 gün   (kısıtlı erişim — read-only)
 {
   "sub": "user-uuid",
   "type": "refresh",
@@ -2712,13 +2797,13 @@ data class JwtProperties(
 
     /**
      * Rol bazlı refresh token süresi döndürür.
-     * STAFF rolü login yapamaz — bu metot çağrılmamalıdır.
+     * STAFF dahil tüm roller için token süresi tanımlıdır.
      */
     fun getRefreshExpirationForRole(role: Role): Long = when (role) {
         Role.PLATFORM_ADMIN -> refreshTokenExpiration.platformAdmin
         Role.TENANT_ADMIN   -> refreshTokenExpiration.tenantAdmin
         Role.CLIENT         -> refreshTokenExpiration.client
-        Role.STAFF          -> throw IllegalArgumentException("STAFF rolü login yapamaz — token üretilmez")
+        Role.STAFF          -> refreshTokenExpiration.staff
     }
 }
 
@@ -2735,8 +2820,8 @@ class AuthService(
         private val logger = LoggerFactory.getLogger(AuthService::class.java)
         const val MAX_FAILED_ATTEMPTS = 5
         const val LOCK_DURATION_MINUTES = 15L
-        // Login yapabilen roller (STAFF hariç)
-        val LOGINABLE_ROLES = setOf(Role.PLATFORM_ADMIN, Role.TENANT_ADMIN, Role.CLIENT)
+        // Login yapabilen roller (STAFF dahil — kısıtlı erişim)
+        val LOGINABLE_ROLES = setOf(Role.PLATFORM_ADMIN, Role.TENANT_ADMIN, Role.CLIENT, Role.STAFF)
     }
 
     @Transactional
@@ -2745,11 +2830,7 @@ class AuthService(
         val user = userRepository.findByEmailAndTenantId(request.email, tenantId)
             ?: throw UnauthorizedException("Geçersiz e-posta veya şifre")
 
-        // STAFF login engeli — STAFF şifresi olmayan personel kaydıdır
-        if (user.role == Role.STAFF) {
-            logger.warn("[tenant={}] STAFF login denemesi engellendi: {}", tenantId, user.email)
-            throw UnauthorizedException("Bu hesap ile giriş yapılamaz")
-        }
+        // STAFF kısıtlı login — şifre kontrolü yapılır, read-only erişim verilir
 
         // Hesap kilitli mi kontrol et
         // KRİTİK: lockedUntil Instant (UTC) — timezone dönüşümü gereksiz
@@ -2828,8 +2909,12 @@ class SecurityConfig(
                     .requestMatchers("/api/webhooks/**").permitAll()  // Dış servis callback (iyzico vb.)
                     // Platform admin
                     .requestMatchers("/api/platform/**").hasAuthority("PLATFORM_ADMIN")    // DÜZELTME: hasRole() ROLE_ prefix ekler — authority ile eşleşmez
-                    // Admin endpoints — sadece TENANT_ADMIN (STAFF login yapmaz!)
+                    // Admin endpoints — sadece TENANT_ADMIN
                     .requestMatchers("/api/admin/**").hasAuthority("TENANT_ADMIN")
+                    // DÜZELTME F3: Client endpoint'leri — sadece CLIENT rolü
+                    .requestMatchers("/api/client/**").hasAuthority("CLIENT")
+                    // DÜZELTME F9: Staff endpoint'leri — STAFF read-only erişim
+                    .requestMatchers("/api/staff/**").hasAuthority("STAFF")
                     // Authenticated
                     .anyRequest().authenticated()
             }
@@ -2846,8 +2931,12 @@ class SecurityConfig(
         return UrlBasedCorsConfigurationSource().apply {
             registerCorsConfiguration("/**", CorsConfiguration().apply {
                 // Statik pattern'lar
+                // DİKKAT (S2): Wildcard subdomain, CORS preflight aşamasında TenantFilter çalışmaz.
+                // evil.app.com gibi kayıt dışı subdomain'ler de CORS geçer.
+                // Üretimde: CorsConfigurationSource içinde tenant doğrulaması eklenmeli
+                // veya allowedOriginPatterns yerine allowedOrigins (tam eşleşme) kullanılmalı.
                 allowedOriginPatterns = mutableListOf(
-                    "https://*.app.com",        // Tüm tenant subdomain'leri
+                    "https://*.app.com",        // Tüm tenant subdomain'leri (subdomain spoofing riski — yukarıdaki nota bkz.)
                     "http://localhost:3000"      // Geliştirme
                 )
 
@@ -2864,9 +2953,10 @@ class SecurityConfig(
                 maxAge = 3600
             })
         }
-        // DÜZELTME NOTU: Custom domain eklendiğinde CORS listesi yenilenmez.
-        // Çözüm: Periyodik @Scheduled job ile CorsConfigurationSource'u yeniden oluştur
-        // veya CachingCorsConfigurationSource (TTL: 5dk) implementasyonu yapın.
+        // DÜZELTME AA-O6: Custom domain eklendiğinde CORS listesi yenilenmez.
+        // Çözüm: @Scheduled(fixedRate = 300_000) job ile CorsConfigurationSource'u
+        // periyodik olarak yeniden oluştur (5 dakikada bir). Alternatif: CachingCorsConfigurationSource
+        // wrapper ile TTL bazlı lazy refresh.
     }
 
     @Bean
@@ -2921,7 +3011,8 @@ class ModuleGuardInterceptor(
 class WebConfig(private val moduleGuardInterceptor: ModuleGuardInterceptor) : WebMvcConfigurer {
     override fun addInterceptors(registry: InterceptorRegistry) {
         registry.addInterceptor(moduleGuardInterceptor)
-            .addPathPatterns("/api/admin/**")    // Sadece admin endpoint'leri
+            .addPathPatterns("/api/admin/**", "/api/public/**", "/api/client/**", "/api/staff/**")
+            // DÜZELTME F6: Public, client ve staff endpoint'lerinde de modül kontrolü
     }
 }
 ```
@@ -2990,6 +3081,16 @@ class RateLimitFilter : OncePerRequestFilter() {
         .maximumSize(10_000)
         .expireAfterAccess(Duration.ofMinutes(5))
         .build()
+
+    // DÜZELTME S3: userId bazlı bucket — authenticated endpoint'lerde IP yerine userId kullan
+    // Proxy/VPN ile farklı IP'lerden sınırsız istek atılmasını engeller
+    private val userBuckets: Cache<String, Bucket> = Caffeine.newBuilder()
+        .maximumSize(50_000)
+        .expireAfterAccess(Duration.ofMinutes(5))
+        .build()
+    // Kullanım: val userId = SecurityContextHolder.getContext().authentication?.name
+    //           val bucket = if (userId != null) userBuckets.get(userId) { createBucket(rule) }
+    //                        else ipBuckets.get(clientIp) { createBucket(rule) }
 
     // Endpoint bazlı rate limit kuralları
     // KRİTİK: Spesifik kurallar ÖNCE listelenmeli! firstOrNull() ilk eşleşeni döndürür.
@@ -3165,9 +3266,9 @@ class LocalStorageProvider(
 class ServiceController(private val serviceService: ServiceManagementService) {
 
     @GetMapping
-    @PreAuthorize("hasAuthority('TENANT_ADMIN')")  // STAFF login yapmaz — sadece TENANT_ADMIN
+    @PreAuthorize("hasAnyAuthority('TENANT_ADMIN', 'STAFF')")  // STAFF read-only erişim
     fun listServices(pageable: Pageable): PagedResponse<ServiceResponse> {
-        // Sadece TENANT_ADMIN görebilir (STAFF login yapmaz)
+        // TENANT_ADMIN ve STAFF (read-only) görebilir
     }
 
     @PostMapping
@@ -3217,11 +3318,11 @@ class GlobalExceptionHandler {
         )
     }
 
-    /** 403 — Yetersiz yetki */
+    /** 403 — Yetersiz yetki (DÜZELTME AA-O9: errorCode → FORBIDDEN) */
     @ExceptionHandler(AccessDeniedException::class)
     fun handleForbidden(ex: AccessDeniedException): ResponseEntity<ErrorResponse> {
         return ResponseEntity.status(HttpStatus.FORBIDDEN).body(
-            ErrorResponse(error = "Bu işlem için yetkiniz yok", code = ErrorCode.CROSS_TENANT_ACCESS)
+            ErrorResponse(error = "Bu işlem için yetkiniz yok", code = ErrorCode.FORBIDDEN)
         )
     }
 
@@ -3265,11 +3366,11 @@ class GlobalExceptionHandler {
         )
     }
 
-    /** 429 — Plan limiti aşıldı */
+    /** 403 — Plan limiti aşıldı (DÜZELTME T2: 429 → 403, RATE_LIMIT_EXCEEDED → PLAN_LIMIT_EXCEEDED) */
     @ExceptionHandler(PlanLimitExceededException::class)
     fun handlePlanLimit(ex: PlanLimitExceededException): ResponseEntity<ErrorResponse> {
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(
-            ErrorResponse(error = ex.message ?: "Plan limiti aşıldı", code = ErrorCode.RATE_LIMIT_EXCEEDED)
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(
+            ErrorResponse(error = ex.message ?: "Plan limiti aşıldı", code = ErrorCode.PLAN_LIMIT_EXCEEDED)
         )
     }
 
@@ -3446,7 +3547,7 @@ CREATE TABLE users (
     tenant_id VARCHAR(36) NOT NULL,
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255) NULL,              -- STAFF rolü login yapmaz → NULL olabilir
+    password_hash VARCHAR(255) NULL,              -- STAFF dahil tüm roller, TENANT_ADMIN şifre belirler
     phone VARCHAR(20),
     image VARCHAR(500),
     role ENUM('PLATFORM_ADMIN','TENANT_ADMIN','STAFF','CLIENT') NOT NULL DEFAULT 'CLIENT',
@@ -3730,6 +3831,7 @@ CREATE TABLE site_settings (
     timezone VARCHAR(50) DEFAULT 'Europe/Istanbul',
     locale VARCHAR(10) DEFAULT 'tr',
     cancellation_policy_hours INT NOT NULL DEFAULT 24,
+    default_slot_duration_minutes INT NOT NULL DEFAULT 30,   -- DÜZELTME: Eksik DDL eklendi (AvailabilityService'te kullanılır)
     theme_settings JSON DEFAULT ('{}'),
 
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
@@ -3985,12 +4087,8 @@ CREATE TABLE treatment_history (
     INDEX idx_treatment_date (tenant_id, treatment_date DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_turkish_ci;
 
--- V19__alter_subscriptions_add_billing.sql
+-- DÜZELTME: V19 kaldırıldı — monthly_price ve billing_period zaten V12'de (CREATE TABLE subscriptions) tanımlı.
 -- NOT: enabled_modules JSON alanı kullanılmaz — SubscriptionModule entity (relational) tercih edilir.
-ALTER TABLE subscriptions
-    ADD COLUMN monthly_price DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER max_storage_mb,
-    ADD COLUMN billing_period VARCHAR(20) NOT NULL DEFAULT 'MONTHLY' AFTER monthly_price;
-
 -- NOT: V20 kaldırıldı — password_hash zaten CREATE TABLE'da NULL olarak tanımlandı.
 -- NOT: no_show_count, is_blacklisted vb. zaten CREATE TABLE'da tanımlandı.
 
@@ -4006,6 +4104,31 @@ ALTER TABLE tenants
 
 -- Mevcut BASIC planları STARTER'a güncelle
 UPDATE tenants SET plan = 'STARTER' WHERE plan = 'BASIC';
+
+-- DÜZELTME F1: V21__create_staff_services_table.sql
+-- Personel-hizmet many-to-many ilişkisi (hangi personel hangi hizmetleri sunuyor)
+CREATE TABLE staff_services (
+    staff_id VARCHAR(36) NOT NULL,
+    service_id VARCHAR(36) NOT NULL,
+    PRIMARY KEY (staff_id, service_id),
+    FOREIGN KEY (staff_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+    INDEX idx_staff_services_service (service_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_turkish_ci;
+
+-- DÜZELTME F8: V22__alter_site_settings_add_auto_confirm.sql
+ALTER TABLE site_settings
+    ADD COLUMN auto_confirm_appointments BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- DÜZELTME: V23__create_processed_webhook_events_table.sql (Webhook idempotency)
+CREATE TABLE processed_webhook_events (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    event_id VARCHAR(255) NOT NULL UNIQUE,      -- Provider'dan gelen event ID
+    provider VARCHAR(50) NOT NULL,               -- IYZICO, STRIPE
+    event_type VARCHAR(100) NOT NULL,            -- payment.success, subscription.cancelled
+    processed_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_webhook_event (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_turkish_ci;
 ```
 
 ---
@@ -4082,20 +4205,12 @@ jwt:
     platform-admin: 86400000              # 1 gün (ms) — en hassas hesap
     tenant-admin: 2592000000              # 30 gün (ms) — günlük işletme yönetimi
     client: 5184000000                    # 60 gün (ms) — kullanıcı deneyimi
-  # NOT: STAFF rolü login YAPMAZ → token almaz
+    staff: 604800000                      # 7 gün (ms) — DÜZELTME F9: STAFF kısıtlı login
 
-# File Upload
-file:
-  upload:
-    provider: ${FILE_PROVIDER:local}     # local | s3 | minio
-    local-path: ./uploads
-    s3:
-      bucket: ${S3_BUCKET:aesthetic-saas}
-      region: ${S3_REGION:eu-central-1}
-      access-key: ${S3_ACCESS_KEY:}
-      secret-key: ${S3_SECRET_KEY:}
+# DÜZELTME: file: bloğu kaldırıldı — storage: bloğu (aşağıda) StorageProvider tarafından kullanılır.
+# Eski file.upload.* property'leri artık storage.* altındadır.
 
-# Logging
+# Logging — DÜZELTME: İki logging bloğu tek blokta birleştirildi (level + pattern)
 logging:
   level:
     root: INFO
@@ -4103,6 +4218,8 @@ logging:
     # Hibernate SQL logları — sadece application-dev.yml'de aktif edin:
     # org.hibernate.SQL: DEBUG
     # org.hibernate.orm.jdbc.bind: TRACE     # Hibernate 6'da BasicBinder yerine orm.jdbc.bind
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] [%X{correlationId}] [tenant=%X{tenantId}] %-5level %logger{36} - %msg%n"
 
 # Notification (Bölüm 18)
 notification:
@@ -4154,11 +4271,6 @@ storage:
 
 server:
   port: ${SERVER_PORT:8080}
-
-# DÜZELTME: Logging pattern — MDC tenantSlug/correlationId görüntüleme
-logging:
-  pattern:
-    console: "%d{HH:mm:ss.SSS} [%thread] [%X{correlationId}] [tenant=%X{tenantId}] %-5level %logger{36} - %msg%n"
 ```
 
 ### 9.1.1 application-dev.yml
@@ -4253,7 +4365,7 @@ dependencies {
     implementation("com.iyzipay:iyzipay-java:2.0.131")
 
     // SendGrid (e-posta bildirimleri — Bölüm 18)
-    implementation("com.sendgrid:sendgrid-java:4.10.1")
+    implementation("com.sendgrid:sendgrid-java:4.10.2")    // DÜZELTME AA-T4: 4.10.1 → 4.10.2 tutarlılaştırıldı
 
     // Micrometer Prometheus (Actuator metrics export — Bölüm 14)
     implementation("io.micrometer:micrometer-registry-prometheus")
@@ -4292,8 +4404,10 @@ tasks.withType<Test> {
 
 ```kotlin
 // FlywayConfig.kt — Flyway migration konfigürasyonu
-// NOT: spring.flyway.* YAML ayarları da mevcuttur (Bölüm 9.1). Custom bean bunları override eder.
-// YAML-only kullanımı tercih edilirse bu sınıf kaldırılabilir (spring.flyway.baseline-version: 0 eklendi).
+// NOT AA-O7: spring.flyway.* YAML ayarları da mevcuttur (Bölüm 9.1). Custom bean bunları override eder.
+// ÖNERİ: Bu sınıf kaldırılarak sadece YAML konfigürasyonu kullanılması önerilir.
+// spring.flyway.baseline-version: 0 ve diğer ayarlar zaten YAML'de mevcuttur.
+// Custom bean, YAML ayarlarını gizler ve iki kaynak arasında tutarsızlık riski oluşturur.
 @Configuration
 class FlywayConfig {
 
@@ -4323,7 +4437,7 @@ class FlywayConfig {
 # Docker Compose V2 — 'version' alanı artık gerekli değil (deprecated)
 services:
   app:
-    build: .
+    build: ../../Desktop/yakup/aesthetic-clinic
     ports:
       - "8080:8080"
     environment:
@@ -4348,7 +4462,7 @@ services:
       - uploads:/app/uploads
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -4361,14 +4475,14 @@ services:
     environment:
       - MYSQL_ROOT_PASSWORD=${DB_PASSWORD:-secret}
       - MYSQL_DATABASE=aesthetic_saas
-    command:                                     # utf8mb4_turkish_ci (Bölüm 8 ile tutarlı)
+    command: # utf8mb4_turkish_ci (Bölüm 8 ile tutarlı)
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_turkish_ci
     volumes:
       - mysql-data:/var/lib/mysql
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -4378,8 +4492,8 @@ services:
     ports:
       - "6379:6379"
     restart: unless-stopped
-    healthcheck:                                         # DÜZELTME: Redis healthcheck eklendi
-      test: ["CMD", "redis-cli", "ping"]
+    healthcheck: # DÜZELTME: Redis healthcheck eklendi
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -4649,6 +4763,7 @@ try {
     MDC.clear()
 }
 
+// DÜZELTME AA-T3: MDC key tutarlılığı — pattern'da %X{tenantSlug} kullanılır.
 // application.yml'de log pattern:
 // logging.pattern.console: "%d{HH:mm:ss.SSS} [%thread] [tenant=%X{tenantSlug}] %-5level %logger{36} - %msg%n"
 
@@ -4659,9 +4774,13 @@ logger.info("Randevu oluşturuldu: {}", appointmentId)
 
 ### 14.3 Audit Log
 ```kotlin
-// Not: AuditLog manuel tenantId kullanır (TenantAwareEntity'den extends etmez),
-// çünkü platform admin tüm tenant'ların loglarını görebilmelidir.
-// Okuma sorgularında tenant filtresi use-case bazlı uygulanır.
+// DÜZELTME T8: AuditLog neden TenantAwareEntity extend ETMİYOR — Tasarım kararı belgelendi:
+// 1. Platform admin tüm tenant'ların loglarını görebilmelidir (cross-tenant görünürlük)
+// 2. TenantAwareEntity extend edilse Hibernate filter otomatik tenant_id filtresi uygular
+//    → platform admin kendi tenant_id'si olmayan logları göremez
+// 3. Bunun yerine manuel tenantId alanı kullanılır + okuma sorgularında:
+//    - TENANT_ADMIN: findByTenantId(tenantId) → kendi tenant logları
+//    - PLATFORM_ADMIN: findAll() → tüm loglar (filtre yok)
 @Entity
 @Table(name = "audit_logs")
 class AuditLog(
@@ -4670,8 +4789,8 @@ class AuditLog(
     val tenantId: String,
     val userId: String,
     val action: String,          // "CREATE_APPOINTMENT", "UPDATE_SERVICE"
-    val entityType: String,      // "Appointment", "Service"
-    val entityId: String,
+    val entityType: String,      // "Appointment", "Service"  — Kasıtlı tasarım (AA-D7): FK yok,
+    val entityId: String,        // entity silindiğinde orphan log kalır — pragmatik yaklaşım (performans + esneklik)
     @Column(columnDefinition = "JSON")                   // DÜZELTME: Hibernate validate JSON ↔ String mapping
     val details: String? = null, // JSON: değişen alanlar
     val ipAddress: String? = null,
@@ -4791,12 +4910,8 @@ class AppointmentConcurrencyTest {
 
 ## 16. Raporlama & İstatistik
 
-> **Not:** Bu bölüm ileride detaylandırılacaktır. Planlanan içerik:
-> - Tenant bazlı dashboard istatistikleri (günlük/haftalık/aylık randevu sayısı, gelir)
-> - Staff performans raporları (randevu sayısı, ortalama rating, iptal oranı)
-> - Hizmet popülerlik analizi (en çok tercih edilen hizmetler, gelir dağılımı)
-> - Müşteri segmentasyonu (yeni/tekrarlayan, LTV hesaplama)
-> - Excel/PDF export desteği
+> **Detaylı implementasyon §22 (DashboardService, Reporting & Analytics) ve §28.10'a (Mimari Notlar) taşınmıştır.**
+> Bu bölümün önceki placeholder içeriği artık somut kodla §22'de yer almaktadır.
 
 ---
 
@@ -4824,15 +4939,18 @@ class Subscription : TenantAwareEntity() {             // DÜZELTME: TenantAware
     var autoRenew: Boolean = true
 
     // Plan limitleri (plan seçimi sırasında service tarafından set edilir)
-    var maxStaff: Int = 1                 // TRIAL: 1, STARTER: 1, PRO: 5, BUS: 15, ENT: sınırsız
-    var maxAppointmentsPerMonth: Int = 100 // TRIAL: 100, STARTER: 100, PRO: 500, BUS: 2000, ENT: sınırsız
+    // DÜZELTME AA-D4: null = sınırsız (ENTERPRISE). Plan limit kontrolünde: if (limit == null) return // sınırsız
+    var maxStaff: Int? = 1                // TRIAL: 1, STARTER: 1, PRO: 5, BUS: 15, ENT: null (sınırsız)
+    var maxAppointmentsPerMonth: Int? = 100 // TRIAL: 100, STARTER: 100, PRO: 500, BUS: 2000, ENT: null (sınırsız)
     var maxStorageMb: Int = 500           // Dosya yükleme limiti (MB)
 
     @Enumerated(EnumType.STRING)
     var status: SubscriptionStatus = SubscriptionStatus.ACTIVE
 
     // Modül sistemi — SubscriptionModule entity ile yönetilir (relational)
-    // NOT: enabledModules JSON alanı KULLANILMAZ — SubscriptionModule tercih edilir.
+    // NOT AA-O1: enabledModules JSON alanı KULLANILMAZ — SubscriptionModule tercih edilir.
+    // Tenant entity'deki Tenant.enabledModules alanı da kullanılmaz; modül erişimi
+    // tamamen SubscriptionModule relational entity üzerinden kontrol edilir.
     // Core modüller (randevu, müşteri yönetimi, bildirim, tema) HER pakette bulunur.
     @OneToMany(mappedBy = "subscription", fetch = FetchType.LAZY, cascade = [CascadeType.ALL])
     val modules: MutableList<SubscriptionModule> = mutableListOf()
@@ -4893,7 +5011,7 @@ class Invoice : TenantAwareEntity() {                   // DÜZELTME: TenantAwar
 
     var invoiceNumber: String = ""            // "INV-2026-0001"
     @Column(precision = 10, scale = 2)
-    var amount: BigDecimal = BigDecimal.ZERO
+    var totalAmount: BigDecimal = BigDecimal.ZERO    // DÜZELTME T9: amount → totalAmount (V12 DDL ile tutarlı)
     var currency: String = "TRY"
     @Column(precision = 10, scale = 2)
     var taxAmount: BigDecimal = BigDecimal.ZERO
@@ -5493,10 +5611,10 @@ class NotificationService(
 
     /**
      * No-show bildirimi — TENANT_ADMIN'a "müşteri randevuya gelmedi" bilgisi gönderir.
+     * DÜZELTME: Appointment yerine NotificationContext (DTO) alır — @Async thread'de lazy loading güvenli
      */
     @Async("taskExecutor")
-    fun sendNoShowNotification(appointment: Appointment) {
-        val ctx = toContext(appointment)
+    fun sendNoShowNotification(ctx: NotificationContext) {
         val template = notificationTemplateRepository
             .findByTenantIdAndType(ctx.tenantId, NotificationType.APPOINTMENT_NO_SHOW) ?: return
 
@@ -5504,36 +5622,44 @@ class NotificationService(
             "clientName" to ctx.clientName,
             "serviceName" to ctx.serviceName,
             "date" to ctx.date,
-            "time" to ctx.time
+            "time" to ctx.startTime
         )
         sendNotification(ctx, template, variables)
     }
 
     /**
      * Kara liste bildirimi — TENANT_ADMIN'a "müşteri kara listeye alındı" bilgisi gönderir.
+     * DÜZELTME: User entity yerine DTO bazlı çağrı — @Async thread'de lazy loading güvenli.
+     * Caller tarafında toBlacklistContext() ile DTO oluşturulmalı.
      */
     @Async("taskExecutor")
-    fun sendClientBlacklistedNotification(client: User) {
-        val tenantId = client.tenantId  // TenantAwareEntity'den
+    fun sendClientBlacklistedNotification(ctx: NotificationContext, noShowCount: Int) {
         val template = notificationTemplateRepository
-            .findByTenantIdAndType(tenantId, NotificationType.CLIENT_BLACKLISTED_NOTICE) ?: return
+            .findByTenantIdAndType(ctx.tenantId, NotificationType.CLIENT_BLACKLISTED_NOTICE) ?: return
 
         val variables = mapOf(
-            "clientName" to client.name,
-            "clientEmail" to client.email,
-            "noShowCount" to client.noShowCount.toString()
+            "clientName" to ctx.clientName,
+            "clientEmail" to ctx.clientEmail,
+            "noShowCount" to noShowCount.toString()
         )
 
         // TENANT_ADMIN'a bildirim gönder
-        val ctx = NotificationContext(
-            tenantId = tenantId,
-            recipientEmail = "", // SettingsService'den alınmalı (tenant admin email)
-            clientName = client.name,
-            serviceName = "",
-            date = "",
-            time = ""
-        )
         sendNotification(ctx, template, variables)
+    }
+
+    /** User entity'den kara liste bildirimi için DTO oluştur — CALLER (transactional context) tarafından çağrılmalı */
+    fun toBlacklistContext(client: User): NotificationContext {
+        return NotificationContext(
+            appointmentId = "",       // Kara liste bildirimi randevuya bağlı değil
+            tenantId = client.tenantId,
+            clientName = client.name,
+            clientEmail = client.email,
+            clientPhone = client.phone ?: "",
+            serviceName = "",
+            staffName = "",
+            date = "",
+            startTime = ""
+        )
     }
 
     /**
@@ -5592,9 +5718,13 @@ class NotificationService(
     }
 
     /** Mustache-style {{variable}} değişken yerleştirme */
+    // DÜZELTME AA-D5: XSS koruması — user input HTML escape edilmeli (email body HTML)
     private fun replaceVariables(template: String, variables: Map<String, String>): String {
         var result = template
-        variables.forEach { (key, value) -> result = result.replace("{{$key}}", value) }
+        variables.forEach { (key, value) ->
+            val safeValue = org.springframework.web.util.HtmlUtils.htmlEscape(value)
+            result = result.replace("{{$key}}", safeValue)
+        }
         return result
     }
 }
@@ -5616,6 +5746,7 @@ class AppointmentReminderJob(
 
     // Her 5 dakikada çalışır
     @Scheduled(fixedRate = 300_000)
+    @SchedulerLock(name = "send24HourReminders", lockAtLeastFor = "4m", lockAtMostFor = "10m")
     fun send24HourReminders() {
         tenantAwareScheduler.executeForAllTenants { tenant ->
             // DÜZELTME: Tenant timezone ile "24 saat sonra" hesapla
@@ -5630,7 +5761,7 @@ class AppointmentReminderJob(
             val updated = mutableListOf<Appointment>()
             appointments.forEach { appointment ->
                 try {                                            // DÜZELTME: Per-appointment error handling
-                    notificationService.sendReminder(appointment, NotificationType.APPOINTMENT_REMINDER_24H)
+                    notificationService.sendReminder(notificationService.toContext(appointment), NotificationType.APPOINTMENT_REMINDER_24H)
                     appointment.reminder24hSent = true
                     updated.add(appointment)
                 } catch (e: Exception) {
@@ -5658,7 +5789,7 @@ class AppointmentReminderJob(
             val updated = mutableListOf<Appointment>()
             appointments.forEach { appointment ->
                 try {
-                    notificationService.sendReminder(appointment, NotificationType.APPOINTMENT_REMINDER_1H)
+                    notificationService.sendReminder(notificationService.toContext(appointment), NotificationType.APPOINTMENT_REMINDER_1H)
                     appointment.reminder1hSent = true
                     updated.add(appointment)
                 } catch (e: Exception) {
@@ -5695,10 +5826,19 @@ notification:
 
 > **NOT:** `RestTemplate` bean tanımı gerekli (Spring Boot otomatik oluşturmaz):
 > ```kotlin
+> // DÜZELTME AA-O8: Bu WebConfig, §7.5'teki ModuleGuardInterceptor WebConfig ile birleştirilmeli.
+> // Tek bir WebConfig class'ı hem RestTemplate bean'ini hem de interceptor kaydını içermelidir.
 > @Configuration
-> class WebConfig {
+> class WebConfig(
+>     private val moduleGuardInterceptor: ModuleGuardInterceptor
+> ) : WebMvcConfigurer {
 >     @Bean
 >     fun restTemplate(builder: RestTemplateBuilder): RestTemplate = builder.build()
+>
+>     override fun addInterceptors(registry: InterceptorRegistry) {
+>         registry.addInterceptor(moduleGuardInterceptor)
+>             .addPathPatterns("/api/admin/**", "/api/public/**", "/api/client/**", "/api/staff/**")
+>     }
 > }
 > ```
 
@@ -5726,7 +5866,7 @@ class SendGridEmailService(
 ) : EmailService {
 
     /** Sağlık kontrolü — Health indicator tarafından çağrılır */
-    fun healthCheck() {
+    override fun healthCheck() {
         // SendGrid API'ye basit bir istek atarak erişilebilirliği doğrula
         val sg = SendGrid(apiKey)
         sg.api(Request().apply { method = Method.GET; endpoint = "scopes" })
@@ -5762,22 +5902,28 @@ class NetgsmSmsService(
     private val apiUrl = "https://api.netgsm.com.tr/sms/send/get"
 
     override fun send(to: String, body: String) {
-        val params = mapOf(
-            "usercode" to username,
-            "password" to password,
-            "gsmno" to to.replace("+", ""),    // +905xx → 905xx
-            "message" to body,
-            "msgheader" to senderId
-        )
-        val url = UriComponentsBuilder.fromUriString(apiUrl)
-            .queryParam("usercode", "{usercode}")
-            .queryParam("password", "{password}")
-            .queryParam("gsmno", "{gsmno}")
-            .queryParam("message", "{message}")
-            .queryParam("msgheader", "{msgheader}")
-            .encode().toUriString()
+        // DÜZELTME S6: GET → POST (şifre URL parametresinde access log'lara düşer!)
+        // apiUrl = "https://api.netgsm.com.tr/sms/send/xml" (POST endpoint)
+        val xmlBody = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <mainbody>
+                <header>
+                    <usercode>${username}</usercode>
+                    <password>${password}</password>
+                    <msgheader>${senderId}</msgheader>
+                </header>
+                <body>
+                    <msg><![CDATA[${body}]]></msg>
+                    <no>${to.replace("+", "")}</no>
+                </body>
+            </mainbody>
+        """.trimIndent()
 
-        val response = restTemplate.getForObject(url, String::class.java, params)
+        val headers = org.springframework.http.HttpHeaders().apply {
+            contentType = org.springframework.http.MediaType.APPLICATION_XML
+        }
+        val request = org.springframework.http.HttpEntity(xmlBody, headers)
+        val response = restTemplate.postForObject(apiUrl, request, String::class.java)
         // Netgsm response: "00" = başarılı, "30" = hatalı numara, "70" = yetersiz bakiye
         if (response == null || !response.startsWith("00")) {
             logger.error("Netgsm SMS hatası — gsmno={}, response={}", to, response)
@@ -5795,11 +5941,32 @@ class NetgsmSmsService(
 
 ```kotlin
 // AsyncConfig.kt (Bölüm 2.4'te tanımlandı) + @Scheduled kullanımı
-// DÜZELTME: Multi-instance deployment'ta duplicate job çalışmasını önlemek için ShedLock kullanılmalı:
+// DÜZELTME P3/AA-T7: ShedLock — Multi-instance duplicate job koruması
+
+// build.gradle.kts:
 // implementation("net.javacrumbs.shedlock:shedlock-spring:5.16.0")
 // implementation("net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.16.0")
-// @EnableSchedulerLock(defaultLockAtMostFor = "10m")
-// Her @Scheduled metoda: @SchedulerLock(name = "jobName", lockAtLeastFor = "4m")
+
+// ShedLockConfig.kt:
+@Configuration
+@EnableSchedulerLock(defaultLockAtMostFor = "10m")
+class ShedLockConfig(private val dataSource: DataSource) {
+    @Bean
+    fun lockProvider(): LockProvider = JdbcTemplateLockProvider(
+        JdbcTemplateLockProvider.Configuration.builder()
+            .withJdbcTemplate(JdbcTemplate(dataSource))
+            .usingDbTime()
+            .build()
+    )
+}
+
+// Flyway migration — V25__create_shedlock_table.sql:
+// CREATE TABLE shedlock (
+//     name VARCHAR(64) NOT NULL PRIMARY KEY,
+//     lock_until TIMESTAMP(3) NOT NULL,
+//     locked_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+//     locked_by VARCHAR(255) NOT NULL
+// ) ENGINE=InnoDB;
 
 @Component
 class ScheduledJobs(
@@ -5817,6 +5984,7 @@ class ScheduledJobs(
 
     // Trial süresi dolan tenant'ları pasifleştir
     @Scheduled(cron = "0 0 2 * * ?")  // Her gece 02:00
+    @SchedulerLock(name = "checkExpiredTrials", lockAtLeastFor = "4m", lockAtMostFor = "10m")
     fun checkExpiredTrials() {
         tenantAwareScheduler.executeForAllTenants { tenant ->
             subscriptionService.checkAndExpireTrial(tenant.id!!)
@@ -5825,6 +5993,7 @@ class ScheduledJobs(
 
     // 30 günden eski okunmuş mesajları temizle
     @Scheduled(cron = "0 0 3 * * ?")  // Her gece 03:00
+    @SchedulerLock(name = "cleanupOldMessages", lockAtLeastFor = "4m", lockAtMostFor = "10m")
     fun cleanupOldMessages() {
         tenantAwareScheduler.executeForAllTenants { tenant ->
             // DÜZELTME: Tenant timezone ile 30 gün öncesini hesapla
@@ -5850,7 +6019,7 @@ class ScheduledJobs(
 
             completedAppointments.forEach { appointment ->
                 try {                                              // DÜZELTME: Per-appointment error handling
-                    notificationService.sendReviewRequest(appointment)
+                    notificationService.sendReviewRequest(notificationService.toContext(appointment))
                 } catch (e: Exception) {
                     logger.error("Değerlendirme isteği gönderilemedi — appointment={}", appointment.id, e)
                 }
@@ -6026,7 +6195,10 @@ class GdprService(
 class ConsentRecord : TenantAwareEntity() {             // DÜZELTME: TenantAwareEntity extend
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
-    val userId: String = ""
+    // DÜZELTME AA-T6: String userId → JPA ilişki (FK constraint ile veri bütünlüğü)
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    var user: User? = null
     // tenantId → TenantAwareEntity'den miras alınır
 
     @Enumerated(EnumType.STRING)
@@ -6050,6 +6222,9 @@ enum class ConsentType {
 ---
 
 ## 21. API Versiyonlama
+
+> **NOT (AA-G5):** Şu an tek versiyon (/api/) yeterlidir. Breaking change gerektiğinde
+> aşağıdaki yapı uygulanacaktır. Erken versiyonlama gereksiz karmaşıklık ekler.
 
 ```
 /api/v1/public/services          ← Mevcut versiyon
@@ -6110,6 +6285,74 @@ GET /api/admin/reports/revenue?from=2026-01-01&to=2026-02-01&groupBy=daily
 GET /api/admin/reports/appointments?from=2026-01-01&to=2026-02-01&staffId=xxx
 GET /api/admin/reports/clients?from=2026-01-01&to=2026-02-01
 GET /api/admin/reports/export?format=xlsx&type=revenue&from=2026-01-01&to=2026-02-01
+```
+
+### 22.2 DashboardService Implementasyonu (DÜZELTME F10)
+
+```kotlin
+@Service
+class DashboardService(
+    private val appointmentRepository: AppointmentRepository,
+    private val paymentRepository: PaymentRepository,
+    private val userRepository: UserRepository,
+    private val reviewRepository: ReviewRepository
+) {
+    /** Bugünkü istatistikler */
+    fun getTodayStats(tenantId: String): TodayStats {
+        val today = LocalDate.now()
+        val todayStart = today.atStartOfDay(ZoneId.systemDefault()).toInstant()
+
+        val appointments = appointmentRepository.countByTenantIdAndDate(tenantId, today)
+        val completed = appointmentRepository.countByTenantIdAndDateAndStatus(
+            tenantId, today, AppointmentStatus.COMPLETED
+        )
+        val revenue = paymentRepository.sumAmountByTenantIdAndPaidAtAfter(tenantId, todayStart) ?: BigDecimal.ZERO
+        val newClients = userRepository.countByTenantIdAndRoleAndCreatedAtAfter(
+            tenantId, Role.CLIENT, todayStart
+        )
+
+        return TodayStats(appointments, completed, revenue, newClients)
+    }
+
+    /** Haftalık/aylık istatistikler */
+    fun getPeriodStats(tenantId: String, from: LocalDate, to: LocalDate): PeriodStats {
+        val fromInstant = from.atStartOfDay(ZoneId.systemDefault()).toInstant()
+        val toInstant = to.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant()
+
+        val totalAppointments = appointmentRepository.countByTenantIdAndDateBetween(tenantId, from, to)
+        val cancelled = appointmentRepository.countByTenantIdAndDateBetweenAndStatus(
+            tenantId, from, to, AppointmentStatus.CANCELLED
+        )
+        val noShows = appointmentRepository.countByTenantIdAndDateBetweenAndStatus(
+            tenantId, from, to, AppointmentStatus.NO_SHOW
+        )
+        val revenue = paymentRepository.sumAmountByTenantIdAndPaidAtBetween(tenantId, fromInstant, toInstant)
+            ?: BigDecimal.ZERO
+
+        return PeriodStats(
+            appointments = totalAppointments,
+            revenue = revenue,
+            cancellationRate = if (totalAppointments > 0) cancelled.toDouble() / totalAppointments else 0.0,
+            noShowRate = if (totalAppointments > 0) noShows.toDouble() / totalAppointments else 0.0
+        )
+    }
+
+    /** En çok talep edilen hizmetler */
+    fun getTopServices(tenantId: String, from: LocalDate, to: LocalDate, limit: Int = 10): List<ServiceStats> {
+        return appointmentRepository.findTopServicesByTenantIdAndDateBetween(tenantId, from, to, PageRequest.of(0, limit))
+    }
+
+    /** Personel performans metrikleri */
+    fun getStaffPerformance(tenantId: String, from: LocalDate, to: LocalDate): List<StaffPerformanceStats> {
+        return appointmentRepository.findStaffPerformanceByTenantIdAndDateBetween(tenantId, from, to)
+    }
+}
+
+// DTO'lar
+data class TodayStats(val appointments: Long, val completed: Long, val revenue: BigDecimal, val newClients: Long)
+data class PeriodStats(val appointments: Long, val revenue: BigDecimal, val cancellationRate: Double, val noShowRate: Double)
+data class ServiceStats(val serviceName: String, val count: Long, val revenue: BigDecimal)
+data class StaffPerformanceStats(val staffName: String, val appointments: Long, val revenue: BigDecimal, val avgRating: Double?)
 ```
 
 ---
@@ -6237,7 +6480,7 @@ services:
       - S3_ACCESS_KEY=${S3_ACCESS_KEY}
       - S3_SECRET_KEY=${S3_SECRET_KEY}
       - SENDGRID_API_KEY=${SENDGRID_API_KEY}
-      - NETGSM_USERCODE=${NETGSM_USERCODE}
+      - NETGSM_USERNAME=${NETGSM_USERNAME}    # DÜZELTME T1: USERCODE → USERNAME (application.yml ile tutarlı)
       - NETGSM_PASSWORD=${NETGSM_PASSWORD}
       - IYZICO_API_KEY=${IYZICO_API_KEY}
       - IYZICO_SECRET_KEY=${IYZICO_SECRET_KEY}
@@ -6340,7 +6583,8 @@ server {
 
 # ─── HTTPS Server ───
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;              # DÜZELTME O2: Nginx 1.25+ "http2" directive deprecated
+    http2 on;                    # Ayrı direktif olarak kullanılmalı
     server_name *.app.com;
 
     # ─── SSL/TLS ───
@@ -6646,6 +6890,1360 @@ SENTRY_DSN=
 
 # ─── Frontend URL (CORS) ───
 FRONTEND_URL=http://localhost:3000
+```
+
+---
+
+---
+
+## 28. Fonksiyonel Eklemeler (Analiz Sonrası)
+
+> Bu bölüm, backend_analysis.md kapsamlı analizi sonucunda tespit edilen fonksiyonel eksiklikleri ve mimari iyileştirmeleri içerir.
+
+### 28.1 Staff-Service İlişkisi (F1)
+
+Personelin hangi hizmetleri sunduğunu belirleyen many-to-many ilişki. Randevu oluşturma sırasında yalnızca ilgili hizmeti sunan personeller listelenir.
+
+```kotlin
+// AvailabilityService — F1 güncellemesi: findAvailableStaff sorgusuna JOIN eklendi
+@Query("""
+    SELECT u FROM User u
+    JOIN u.services s
+    WHERE u.tenantId = :tenantId
+    AND u.role = 'STAFF'
+    AND u.isActive = true
+    AND s.id = :serviceId
+    AND NOT EXISTS (
+        SELECT a FROM Appointment a
+        WHERE a.staff.id = u.id
+        AND a.date = :date
+        AND a.status NOT IN ('CANCELLED', 'NO_SHOW')
+        AND a.startTime < :endTime
+        AND a.endTime > :startTime
+    )
+""")
+fun findAvailableStaffForService(
+    @Param("tenantId") tenantId: String,
+    @Param("serviceId") serviceId: String,
+    @Param("date") date: LocalDate,
+    @Param("startTime") startTime: LocalTime,
+    @Param("endTime") endTime: LocalTime
+): List<User>
+
+// Public API — müşterilerin hizmete göre personel listesi alması
+@RestController
+@RequestMapping("/api/public")
+class PublicStaffController(private val availabilityService: AvailabilityService) {
+    @GetMapping("/staff")
+    fun getStaffByService(
+        @RequestParam serviceId: String,
+        @RequestParam(required = false) date: LocalDate?
+    ): ResponseEntity<List<StaffPublicResponse>> {
+        // DÜZELTME AA-E11: StaffPublicResponse staff_services ilişkisiyle desteklenir
+        val staff = if (date != null) {
+            availabilityService.findAvailableStaffForDate(serviceId, date)
+        } else {
+            availabilityService.findStaffForService(serviceId)
+        }
+        return ResponseEntity.ok(staff.map { StaffPublicResponse.from(it) })
+    }
+}
+
+data class StaffPublicResponse(
+    val id: String,
+    val name: String,
+    val title: String?,      // "Dr.", "Uzm." vb.
+    val image: String?,
+    val services: List<String>   // Sunduğu hizmet adları
+) {
+    companion object {
+        fun from(user: User) = StaffPublicResponse(
+            id = user.id!!,
+            name = user.name,
+            title = user.title,
+            image = user.image,
+            services = user.services.map { it.title }
+        )
+    }
+}
+```
+
+### 28.2 Randevu Yeniden Planlama — Reschedule (F2)
+
+```kotlin
+// AppointmentService — reschedule metodu
+@Transactional(isolation = Isolation.READ_COMMITTED)
+fun rescheduleAppointment(
+    id: String,
+    newDate: LocalDate,
+    newTime: LocalTime,
+    newStaffId: String? = null
+): Appointment {
+    val tenantId = TenantContext.getTenantId()
+    val appointment = appointmentRepository.findById(id)
+        .orElseThrow { ResourceNotFoundException("Randevu bulunamadı: $id") }
+
+    // Sadece PENDING veya CONFIRMED durumundaki randevular yeniden planlanabilir
+    require(appointment.status in listOf(AppointmentStatus.PENDING, AppointmentStatus.CONFIRMED)) {
+        "Sadece bekleyen veya onaylanmış randevular yeniden planlanabilir"
+    }
+
+    // İptal politikası kontrolü (reschedule için de geçerli)
+    validateCancellationPolicy(appointment)
+
+    val staffId = newStaffId ?: appointment.staff?.id
+        ?: throw IllegalStateException("Personel belirtilmemiş")
+    val duration = appointment.endTime.toSecondOfDay() - appointment.startTime.toSecondOfDay()
+    val newEndTime = newTime.plusSeconds(duration.toLong())
+
+    // Çakışma kontrolü
+    val conflicts = appointmentRepository.findConflictingAppointmentsWithLock(
+        tenantId, staffId, newDate, newTime, newEndTime
+    ).filter { it.id != id }  // Kendi kendisiyle çakışma kontrolü
+
+    if (conflicts.isNotEmpty()) {
+        throw AppointmentConflictException("Seçilen zaman diliminde başka bir randevu mevcut")
+    }
+
+    // Eski değerleri logla
+    val oldDate = appointment.date
+    val oldTime = appointment.startTime
+    val oldStaffId = appointment.staff?.id
+
+    // Güncelle
+    appointment.date = newDate
+    appointment.startTime = newTime
+    appointment.endTime = newEndTime
+    if (newStaffId != null) {
+        appointment.staff = userRepository.findById(newStaffId)
+            .orElseThrow { ResourceNotFoundException("Personel bulunamadı: $newStaffId") }
+    }
+
+    val saved = appointmentRepository.save(appointment)
+
+    // Bildirim gönder (APPOINTMENT_RESCHEDULED — NotificationType'ta zaten tanımlı)
+    val ctx = notificationService.toContext(saved)
+    notificationService.sendAppointmentRescheduled(ctx, oldDate.toString(), oldTime.toString())
+
+    // Audit log
+    auditLogService.log(
+        action = "RESCHEDULE_APPOINTMENT",
+        entityType = "Appointment",
+        entityId = id,
+        details = mapOf(
+            "oldDate" to oldDate.toString(),
+            "oldTime" to oldTime.toString(),
+            "oldStaffId" to (oldStaffId ?: ""),
+            "newDate" to newDate.toString(),
+            "newTime" to newTime.toString(),
+            "newStaffId" to (staffId)
+        )
+    )
+
+    return saved
+}
+```
+
+```kotlin
+// NotificationService — reschedule bildirimi
+@Async("taskExecutor")
+@Retryable(value = [NotificationDeliveryException::class], maxAttempts = 3, backoff = Backoff(delay = 2000))
+fun sendAppointmentRescheduled(ctx: NotificationContext, oldDate: String, oldTime: String) {
+    val template = notificationTemplateRepository
+        .findByTenantIdAndType(ctx.tenantId, NotificationType.APPOINTMENT_RESCHEDULED)
+        ?: return
+
+    val variables = mapOf(
+        "clientName" to ctx.clientName,
+        "serviceName" to ctx.serviceName,
+        "oldDate" to oldDate,
+        "oldTime" to oldTime,
+        "newDate" to ctx.date,
+        "newTime" to ctx.startTime,
+        "staffName" to ctx.staffName
+    )
+
+    sendNotification(ctx, template, variables)
+}
+```
+
+### 28.3 Client API Endpoint'leri (F3)
+
+```kotlin
+@RestController
+@RequestMapping("/api/client")
+class ClientController(
+    private val appointmentService: AppointmentService,
+    private val reviewService: ReviewService,
+    private val userService: UserService
+) {
+    /** Kendi randevularım (geçmiş + gelecek) */
+    @GetMapping("/my-appointments")
+    fun getMyAppointments(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @RequestParam(required = false) status: AppointmentStatus?,
+        pageable: Pageable
+    ): ResponseEntity<Page<AppointmentResponse>> {
+        val appointments = appointmentService.findByClientId(principal.userId, status, pageable)
+        return ResponseEntity.ok(appointments)
+    }
+
+    /** Kendi değerlendirmelerim */
+    @GetMapping("/my-reviews")
+    fun getMyReviews(@AuthenticationPrincipal principal: UserPrincipal): ResponseEntity<List<ReviewResponse>> {
+        return ResponseEntity.ok(reviewService.findByClientId(principal.userId))
+    }
+
+    /** Yeni değerlendirme ekle */
+    @PostMapping("/reviews")
+    fun createReview(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @Valid @RequestBody request: CreateReviewRequest
+    ): ResponseEntity<ReviewResponse> {
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(reviewService.createReview(principal.userId, request))
+    }
+
+    /** Profil güncelleme (ad, telefon, e-posta) */
+    @PutMapping("/profile")
+    fun updateProfile(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @Valid @RequestBody request: UpdateProfileRequest
+    ): ResponseEntity<UserResponse> {
+        return ResponseEntity.ok(userService.updateClientProfile(principal.userId, request))
+    }
+
+    /** Randevu iptal (iptal politikası geçerli) */
+    @PostMapping("/appointments/{id}/cancel")
+    fun cancelAppointment(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @PathVariable id: String
+    ): ResponseEntity<AppointmentResponse> {
+        return ResponseEntity.ok(appointmentService.cancelByClient(principal.userId, id))
+    }
+}
+
+data class UpdateProfileRequest(
+    @field:NotBlank val name: String,
+    @field:Pattern(regexp = "^\\+?[0-9]{10,15}$") val phone: String?,
+    @field:Email val email: String
+)
+```
+
+### 28.4 Misafir → Kayıtlı Müşteri Eşleştirme (F4)
+
+```kotlin
+// AuthService.register() — kayıt sırasında mevcut misafir randevuları eşleştir
+@Transactional
+fun register(request: RegisterRequest): AuthResponse {
+    // ... mevcut kayıt mantığı ...
+    val user = userRepository.save(newUser)
+
+    // DÜZELTME F4: Misafir randevuları eşleştir
+    // Kayıt öncesi email ile yapılmış ama clientId olmayan randevuları bul
+    val guestAppointments = appointmentRepository
+        .findByClientEmailAndClientIdIsNull(user.email)
+    if (guestAppointments.isNotEmpty()) {
+        guestAppointments.forEach { appointment ->
+            appointment.clientId = user.id
+        }
+        appointmentRepository.saveAll(guestAppointments)
+        logger.info("Misafir randevuları eşleştirildi — userId={}, count={}", user.id, guestAppointments.size)
+    }
+
+    // ... JWT oluşturma ve dönüş ...
+    return generateAuthResponse(user)
+}
+```
+
+### 28.5 Ödeme Yaşam Döngüsü (F5)
+
+```kotlin
+@Service
+class PaymentLifecycleService(
+    private val subscriptionRepository: SubscriptionRepository,
+    private val paymentRepository: PaymentRepository,
+    private val iyzicoService: IyzicoService
+) {
+    /** Plan yükseltme — proration hesabı ile */
+    @Transactional
+    fun upgradePlan(tenantId: String, newPlan: PlanType): Subscription {
+        val subscription = subscriptionRepository.findByTenantIdAndStatus(tenantId, SubscriptionStatus.ACTIVE)
+            ?: throw ResourceNotFoundException("Aktif abonelik bulunamadı")
+
+        val remainingDays = ChronoUnit.DAYS.between(LocalDate.now(), subscription.endDate)
+        val dailyRateOld = subscription.monthlyPrice / BigDecimal(30)
+        val dailyRateNew = getPlanPrice(newPlan) / BigDecimal(30)
+        val prorationAmount = (dailyRateNew - dailyRateOld) * BigDecimal(remainingDays)
+
+        if (prorationAmount > BigDecimal.ZERO) {
+            iyzicoService.chargeProration(tenantId, prorationAmount)
+        }
+
+        subscription.plan = newPlan.name
+        subscription.monthlyPrice = getPlanPrice(newPlan)
+        subscription.maxStaff = getPlanLimits(newPlan).maxStaff
+        subscription.maxAppointmentsPerMonth = getPlanLimits(newPlan).maxAppointments
+        subscription.maxStorageMb = getPlanLimits(newPlan).maxStorageMb
+
+        return subscriptionRepository.save(subscription)
+    }
+
+    /** Plan düşürme — dönem sonunda geçerli */
+    @Transactional
+    fun downgradePlan(tenantId: String, newPlan: PlanType): Subscription {
+        val subscription = subscriptionRepository.findByTenantIdAndStatus(tenantId, SubscriptionStatus.ACTIVE)
+            ?: throw ResourceNotFoundException("Aktif abonelik bulunamadı")
+
+        // Hemen değiştirme — dönem sonunda geçerli olacak şekilde işaretle
+        subscription.pendingPlanChange = newPlan.name
+        return subscriptionRepository.save(subscription)
+    }
+
+    /** Otomatik yenileme job'ı — her gün 00:00'da çalışır */
+    @Scheduled(cron = "0 0 0 * * ?")
+    fun processAutoRenewals() {
+        val expiringToday = subscriptionRepository.findByEndDateAndAutoRenewTrueAndStatus(
+            LocalDate.now(), SubscriptionStatus.ACTIVE
+        )
+        expiringToday.forEach { subscription ->
+            try {
+                val payment = iyzicoService.chargeSubscription(subscription)
+                subscription.endDate = subscription.endDate.plusMonths(
+                    if (subscription.billingPeriod == "YEARLY") 12 else 1
+                )
+                // Bekleyen plan değişikliği varsa uygula
+                subscription.pendingPlanChange?.let { newPlan ->
+                    subscription.plan = newPlan
+                    subscription.pendingPlanChange = null
+                }
+                subscriptionRepository.save(subscription)
+            } catch (e: PaymentException) {
+                // Grace period başlat: 7 gün, 3 retry
+                subscription.status = SubscriptionStatus.PAST_DUE
+                subscription.retryCount = 0
+                subscription.nextRetryAt = Instant.now().plus(Duration.ofDays(2))
+                subscriptionRepository.save(subscription)
+            }
+        }
+    }
+
+    /** Başarısız ödeme retry — her 6 saatte çalışır */
+    @Scheduled(fixedRate = 21_600_000)
+    fun retryFailedPayments() {
+        val pastDue = subscriptionRepository.findByStatusAndNextRetryAtBefore(
+            SubscriptionStatus.PAST_DUE, Instant.now()
+        )
+        pastDue.forEach { subscription ->
+            try {
+                iyzicoService.chargeSubscription(subscription)
+                subscription.status = SubscriptionStatus.ACTIVE
+                subscription.retryCount = 0
+                subscription.nextRetryAt = null
+                subscriptionRepository.save(subscription)
+            } catch (e: PaymentException) {
+                subscription.retryCount++
+                if (subscription.retryCount >= 3) {
+                    // 3 deneme sonrası → EXPIRED
+                    subscription.status = SubscriptionStatus.EXPIRED
+                } else {
+                    subscription.nextRetryAt = Instant.now().plus(Duration.ofDays(2))
+                }
+                subscriptionRepository.save(subscription)
+            }
+        }
+    }
+
+    /** iyzico refund */
+    fun refundPayment(paymentId: String): Payment {
+        val payment = paymentRepository.findById(paymentId)
+            .orElseThrow { ResourceNotFoundException("Ödeme bulunamadı: $paymentId") }
+        iyzicoService.refund(payment.providerPaymentId!!)
+        payment.status = PaymentStatus.REFUNDED
+        return paymentRepository.save(payment)
+    }
+}
+```
+
+### 28.6 Varsayılan Bildirim Template'leri (F7)
+
+```kotlin
+// TenantOnboardingService — onboarding adımına varsayılan template ekleme
+private fun createDefaultNotificationTemplates(tenantId: String) {
+    val defaults = listOf(
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_CONFIRMATION
+            this.emailSubject = "Randevunuz Onaylandı"
+            this.emailBody = """
+                Sayın {{clientName}},
+                {{date}} tarihinde saat {{startTime}}'da {{serviceName}} randevunuz onaylanmıştır.
+                Personel: {{staffName}}
+                İyi günler dileriz.
+            """.trimIndent()
+            this.smsBody = "{{clientName}}, {{date}} {{startTime}} randevunuz onaylandı. {{serviceName}} - {{staffName}}"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_REMINDER_24H
+            this.emailSubject = "Randevu Hatırlatması — Yarın"
+            this.emailBody = """
+                Sayın {{clientName}},
+                Yarın {{startTime}}'da {{serviceName}} randevunuz bulunmaktadır.
+                Personel: {{staffName}}
+                Randevunuzu iptal etmek veya değiştirmek için lütfen bizimle iletişime geçin.
+            """.trimIndent()
+            this.smsBody = "Hatırlatma: Yarın {{startTime}} {{serviceName}} randevunuz var. {{staffName}}"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_REMINDER_1H
+            this.emailSubject = "Randevu Hatırlatması — 1 Saat"
+            this.emailBody = "Sayın {{clientName}}, 1 saat sonra {{serviceName}} randevunuz başlayacaktır."
+            this.smsBody = "1 saat sonra {{serviceName}} randevunuz var. {{staffName}}"
+            this.isEmailEnabled = false   // Varsayılan: sadece SMS
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_CANCELLED
+            this.emailSubject = "Randevunuz İptal Edildi"
+            this.emailBody = "Sayın {{clientName}}, {{date}} tarihli {{serviceName}} randevunuz iptal edilmiştir."
+            this.smsBody = "{{clientName}}, {{date}} {{startTime}} randevunuz iptal edildi."
+            this.isEmailEnabled = true
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_RESCHEDULED
+            this.emailSubject = "Randevunuz Yeniden Planlandı"
+            this.emailBody = """
+                Sayın {{clientName}},
+                Randevunuz {{oldDate}} {{oldTime}} → {{newDate}} {{newTime}} olarak değiştirilmiştir.
+                Personel: {{staffName}}
+            """.trimIndent()
+            this.smsBody = "Randevunuz değişti: {{newDate}} {{newTime}}. {{serviceName}} - {{staffName}}"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.REVIEW_REQUEST
+            this.emailSubject = "Deneyiminizi Değerlendirin"
+            this.emailBody = """
+                Sayın {{clientName}},
+                {{serviceName}} hizmetimizden memnun kaldınız mı?
+                Deneyiminizi değerlendirerek bize yardımcı olabilirsiniz.
+            """.trimIndent()
+            this.smsBody = "{{clientName}}, {{serviceName}} hizmetimizi değerlendirir misiniz?"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = false
+        },
+        // ── Eksik template'ler (BUG-3/F7 düzeltmesi) ──
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.WELCOME
+            this.emailSubject = "Hoş Geldiniz — {{siteName}}"
+            this.emailBody = """
+                Sayın {{clientName}},
+                Kaydınız başarıyla oluşturuldu! Artık online randevu alabilirsiniz.
+                {{siteName}} ailesine hoş geldiniz.
+            """.trimIndent()
+            this.smsBody = "{{clientName}}, {{siteName}}'e hoş geldiniz! Kaydınız başarılı."
+            this.isEmailEnabled = true
+            this.isSmsEnabled = true
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.PASSWORD_RESET
+            this.emailSubject = "Şifre Sıfırlama"
+            this.emailBody = """
+                Sayın {{clientName}},
+                Şifre sıfırlama talebiniz alınmıştır.
+                Aşağıdaki bağlantıyı kullanarak yeni şifrenizi belirleyebilirsiniz:
+                {{resetLink}}
+                Bu bağlantı 1 saat geçerlidir. Talepte bulunmadıysanız bu e-postayı görmezden gelin.
+            """.trimIndent()
+            this.smsBody = "Şifre sıfırlama: {{resetLink}} (1 saat geçerli)"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = false
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.APPOINTMENT_NO_SHOW
+            this.emailSubject = "Randevuya Gelinmedi"
+            this.emailBody = """
+                {{clientName}}, {{date}} tarihinde saat {{time}} randevusuna gelmemiştir.
+                Bu müşterinin toplam gelmeme sayısı: {{noShowCount}}.
+                Hizmet: {{serviceName}}, Personel: {{staffName}}
+            """.trimIndent()
+            this.smsBody = "{{clientName}} {{date}} {{time}} randevuya gelmedi ({{noShowCount}}. kez)"
+            this.isEmailEnabled = true
+            this.isSmsEnabled = false
+        },
+        NotificationTemplate().apply {
+            this.tenantId = tenantId
+            this.type = NotificationType.CLIENT_BLACKLISTED_NOTICE
+            this.emailSubject = "Müşteri Kara Listede"
+            this.emailBody = """
+                {{clientName}} müşterisi {{noShowCount}} kez randevuya gelmemiştir.
+                Sistem tarafından otomatik olarak kara listeye alınmıştır.
+                Bu müşteri artık yeni randevu oluşturamaz.
+            """.trimIndent()
+            this.smsBody = "{{clientName}} {{noShowCount}} kez gelmedi, kara listeye alındı."
+            this.isEmailEnabled = true
+            this.isSmsEnabled = false
+        }
+    )
+    notificationTemplateRepository.saveAll(defaults)
+}
+```
+
+### 28.7 Otomatik Randevu Onay (F8)
+
+```kotlin
+// SiteSettings entity — yeni alan
+var autoConfirmAppointments: Boolean = false    // DÜZELTME F8: Otomatik onay
+
+// AppointmentService.createAppointment() — otomatik onay kontrolü
+@Transactional(isolation = Isolation.READ_COMMITTED)
+fun createAppointment(request: CreateAppointmentRequest): Appointment {
+    // ... mevcut validasyon ve kaydetme mantığı ...
+    val appointment = appointmentRepository.save(newAppointment)
+
+    // DÜZELTME F8: Otomatik onay kontrolü
+    val settings = siteSettingsRepository.findByTenantId(TenantContext.getTenantId())
+    if (settings?.autoConfirmAppointments == true) {
+        appointment.status = AppointmentStatus.CONFIRMED
+        appointmentRepository.save(appointment)
+    }
+
+    // Bildirim gönder
+    val ctx = notificationService.toContext(appointment)
+    notificationService.sendAppointmentConfirmation(ctx)
+
+    return appointment
+}
+```
+
+### 28.8 STAFF Rolü — Kısıtlı Login (F9)
+
+```kotlin
+// AuthService — STAFF login desteği
+// DÜZELTME F9: STAFF login engeli kaldırıldı — kısıtlı (read-only) erişim
+fun login(request: LoginRequest): AuthResponse {
+    val user = userRepository.findByEmailAndTenantId(request.email, TenantContext.getTenantId())
+        ?: throw UnauthorizedException("Geçersiz e-posta veya şifre")
+
+    // STAFF artık login YAPABİLİR (kısıtlı erişim)
+    if (!user.isActive) {
+        throw UnauthorizedException("Hesap devre dışı")
+    }
+
+    // ... mevcut şifre doğrulama, brute force kontrolü ...
+    return generateAuthResponse(user)
+}
+
+// StaffController — STAFF read-only endpoint'leri
+@RestController
+@RequestMapping("/api/staff")
+class StaffController(
+    private val appointmentRepository: AppointmentRepository,
+    private val workingHoursRepository: WorkingHoursRepository
+) {
+    /** Kendi takvimim — bugünkü randevular */
+    @GetMapping("/my-calendar")
+    fun getMyCalendar(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @RequestParam(required = false) date: LocalDate?
+    ): ResponseEntity<List<AppointmentResponse>> {
+        val targetDate = date ?: LocalDate.now()
+        val appointments = appointmentRepository.findByTenantIdAndStaffIdAndDateOrderByStartTime(
+            TenantContext.getTenantId(), principal.userId, targetDate
+        )
+        return ResponseEntity.ok(appointments.map { AppointmentResponse.from(it) })
+    }
+
+    /** Kendi çalışma saatlerim */
+    @GetMapping("/my-schedule")
+    fun getMySchedule(
+        @AuthenticationPrincipal principal: UserPrincipal
+    ): ResponseEntity<List<WorkingHoursResponse>> {
+        val hours = workingHoursRepository.findByTenantIdAndStaffId(
+            TenantContext.getTenantId(), principal.userId
+        )
+        return ResponseEntity.ok(hours.map { WorkingHoursResponse.from(it) })
+    }
+
+    /** Belirli bir randevunun detayı (sadece kendi randevuları) */
+    @GetMapping("/appointments/{id}")
+    fun getAppointmentDetail(
+        @AuthenticationPrincipal principal: UserPrincipal,
+        @PathVariable id: String
+    ): ResponseEntity<AppointmentResponse> {
+        val appointment = appointmentRepository.findById(id)
+            .orElseThrow { ResourceNotFoundException("Randevu bulunamadı: $id") }
+
+        // Sadece kendi randevusu mu kontrol et
+        require(appointment.staff?.id == principal.userId) {
+            throw AccessDeniedException("Bu randevuya erişim yetkiniz yok")
+        }
+
+        return ResponseEntity.ok(AppointmentResponse.from(appointment))
+    }
+}
+```
+
+### 28.9 Recurring Appointment Self-Invocation Düzeltmesi (F11 / AA-O3)
+
+```kotlin
+// DÜZELTME F11/AA-O3: Spring AOP proxy self-invocation sorunu.
+// Aynı class içinde @Transactional/@Async metod çağrısı proxy'yi bypass eder.
+// Çözüm: Recurring logic ayrı bir bean'e taşındı.
+
+@Service
+class RecurringAppointmentService(
+    private val appointmentService: AppointmentService,
+    private val appointmentRepository: AppointmentRepository
+) {
+    /**
+     * Tekrarlayan randevu oluşturma — her instance için AppointmentService.createAppointment() çağırır.
+     * Böylece @Transactional annotation'ı doğru çalışır (proxy üzerinden).
+     */
+    @Transactional
+    fun createRecurringAppointments(
+        baseRequest: CreateAppointmentRequest,
+        recurrenceRule: RecurrenceRule
+    ): List<Appointment> {
+        val appointments = mutableListOf<Appointment>()
+        var currentDate = baseRequest.date
+
+        repeat(recurrenceRule.occurrences) {
+            val request = baseRequest.copy(date = currentDate)
+            try {
+                val appointment = appointmentService.createAppointment(request)
+                appointments.add(appointment)
+            } catch (e: AppointmentConflictException) {
+                // Çakışan tarihleri atla, diğerlerine devam et
+                logger.warn("Recurring randevu çakışması atlandı — date={}", currentDate)
+            }
+            currentDate = when (recurrenceRule.frequency) {
+                RecurrenceFrequency.DAILY -> currentDate.plusDays(1)
+                RecurrenceFrequency.WEEKLY -> currentDate.plusWeeks(1)
+                RecurrenceFrequency.BIWEEKLY -> currentDate.plusWeeks(2)
+                RecurrenceFrequency.MONTHLY -> currentDate.plusMonths(1)
+            }
+        }
+
+        return appointments
+    }
+
+    companion object {
+        private val logger = LoggerFactory.getLogger(RecurringAppointmentService::class.java)
+    }
+}
+```
+
+### 28.10 Mimari Notlar ve Gelecek Geliştirmeler
+
+#### AA-O4: WorkingHours Çoklu Aralık Desteği
+> **Gelecek geliştirme:** Mevcut yapı günde tek çalışma aralığı destekler (09:00-18:00).
+> Öğle arası veya bölünmüş vardiyalar (09:00-12:00, 14:00-18:00) için WorkingHours entity'sine
+> `@ElementCollection` ile `List<TimeRange>` desteği eklenmelidir. Bu değişiklik
+> `AvailabilityService.getAvailableSlots()` algoritmasını da etkiler.
+
+#### Timezone Validasyonu
+```kotlin
+// SiteSettings — timezone validasyonu
+@Column(length = 50)
+var timezone: String = "Europe/Istanbul"
+    set(value) {
+        // DÜZELTME: Geçersiz timezone değerlerini engelle
+        try {
+            ZoneId.of(value)
+        } catch (e: DateTimeException) {
+            throw IllegalArgumentException("Geçersiz timezone: $value")
+        }
+        field = value
+    }
+```
+
+#### ElementCollection Sıralama
+> **NOT:** `@ElementCollection` kullanılan koleksiyonlarda `@OrderColumn` eklenmeli.
+> Aksi halde Hibernate her güncelleme'de delete + re-insert yapar (performans sorunu).
+> Örnek: `WorkingHours.breaks`, `Appointment.services` gibi ilişkilerde dikkat edilmeli.
+
+#### Webhook İdempotency
+```kotlin
+// WebhookController — idempotency kontrolü
+@PostMapping("/api/webhooks/iyzico")
+fun handleIyzicoWebhook(@RequestBody payload: String, @RequestHeader headers: Map<String, String>): ResponseEntity<Void> {
+    val eventId = extractEventId(payload)
+
+    // DÜZELTME: Aynı event birden fazla kez işlenmesin
+    if (processedWebhookEventRepository.existsByEventId(eventId)) {
+        return ResponseEntity.ok().build()  // Zaten işlendi — 200 dön
+    }
+
+    // ... webhook işleme mantığı ...
+
+    // İşlenen event'i kaydet
+    processedWebhookEventRepository.save(ProcessedWebhookEvent().apply {
+        this.eventId = eventId
+        this.provider = "IYZICO"
+        this.eventType = extractEventType(payload)
+    })
+
+    return ResponseEntity.ok().build()
+}
+```
+
+#### Tika Singleton
+```kotlin
+// FileValidationService — Apache Tika singleton
+// DÜZELTME: Her dosya yüklemede yeni Tika instance oluşturmak gereksiz.
+// Tika thread-safe'dir, singleton yeterlidir.
+class FileValidationService {
+    companion object {
+        private val tika = Tika()   // Singleton — thread-safe
+    }
+
+    fun detectMimeType(inputStream: InputStream): String {
+        return tika.detect(inputStream)
+    }
+}
+```
+
+#### S4: Şifre Politikası (PasswordPolicyValidator)
+```kotlin
+// DÜZELTME S4: BCrypt hash var ama pre-hash validation YOK — "123456" kabul edilir!
+// RegisterRequest ve ResetPasswordRequest'e @Password custom annotation eklenmeli.
+
+@Target(AnnotationTarget.FIELD)
+@Retention(AnnotationRetention.RUNTIME)
+@Constraint(validatedBy = [PasswordPolicyValidator::class])
+annotation class Password(
+    val message: String = "Şifre politikasına uygun değil",
+    val groups: Array<KClass<*>> = [],
+    val payload: Array<KClass<out Payload>> = []
+)
+
+class PasswordPolicyValidator : ConstraintValidator<Password, String> {
+    companion object {
+        private val COMMON_PASSWORDS = setOf("123456", "password", "12345678", "qwerty", "abc123",
+            "monkey", "1234567", "letmein", "trustno1", "dragon", "sifre123", "admin123")
+    }
+
+    override fun isValid(value: String?, context: ConstraintValidatorContext): Boolean {
+        if (value == null) return false
+        val violations = mutableListOf<String>()
+        if (value.length < 8) violations.add("En az 8 karakter olmalı")
+        if (!value.any { it.isUpperCase() }) violations.add("En az 1 büyük harf olmalı")
+        if (!value.any { it.isLowerCase() }) violations.add("En az 1 küçük harf olmalı")
+        if (!value.any { it.isDigit() }) violations.add("En az 1 rakam olmalı")
+        if (value.lowercase() in COMMON_PASSWORDS) violations.add("Çok yaygın bir şifre")
+        if (violations.isNotEmpty()) {
+            context.disableDefaultConstraintViolation()
+            context.buildConstraintViolationWithTemplate(violations.joinToString("; "))
+                .addConstraintViolation()
+            return false
+        }
+        return true
+    }
+}
+
+// Kullanım:
+// data class RegisterRequest(
+//     @field:Email val email: String,
+//     @field:Password val password: String,   // ← Şifre politikası uygulanır
+//     @field:NotBlank val name: String
+// )
+```
+
+#### S5: Email Doğrulama (EmailVerificationService)
+```kotlin
+// DÜZELTME S5: Sahte email ile hesap oluşturulabiliyor — email doğrulama gerekli.
+
+@Entity
+@Table(name = "email_verifications")
+class EmailVerification : TenantAwareEntity() {
+    @Id @GeneratedValue(strategy = GenerationType.UUID)
+    val id: String? = null
+    val userId: String = ""
+    val token: String = ""                    // SecureRandom 64 karakter hex
+    val expiresAt: Instant = Instant.now().plus(Duration.ofHours(1))
+    var verifiedAt: Instant? = null
+}
+
+// Flyway migration — V24__create_email_verifications_table.sql:
+// CREATE TABLE email_verifications (
+//     id VARCHAR(36) NOT NULL PRIMARY KEY,
+//     tenant_id VARCHAR(36) NOT NULL,
+//     user_id VARCHAR(36) NOT NULL,
+//     token VARCHAR(64) NOT NULL UNIQUE,
+//     expires_at TIMESTAMP(6) NOT NULL,
+//     verified_at TIMESTAMP(6) NULL,
+//     created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6),
+//     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+//     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+//     INDEX idx_email_verify_token (token)
+// );
+
+// User entity'ye eklenmeli:
+// var isEmailVerified: Boolean = false
+
+@Service
+class EmailVerificationService(
+    private val emailVerificationRepository: EmailVerificationRepository,
+    private val userRepository: UserRepository,
+    private val notificationService: NotificationService
+) {
+    fun sendVerificationEmail(userId: String) {
+        val token = generateSecureToken()
+        val verification = EmailVerification().apply {
+            this.userId = userId
+            this.token = token
+        }
+        emailVerificationRepository.save(verification)
+        // E-posta gönder: {{verifyLink}} = /api/auth/verify-email?token=$token
+    }
+
+    // POST /api/auth/verify-email?token=xxx
+    fun verifyEmail(token: String): Boolean {
+        val verification = emailVerificationRepository.findByToken(token)
+            ?: throw ResourceNotFoundException("Geçersiz doğrulama token'ı")
+        if (verification.expiresAt.isBefore(Instant.now()))
+            throw IllegalStateException("Doğrulama linki süresi dolmuş")
+        if (verification.verifiedAt != null)
+            throw IllegalStateException("E-posta zaten doğrulanmış")
+        verification.verifiedAt = Instant.now()
+        emailVerificationRepository.save(verification)
+        val user = userRepository.findById(verification.userId).orElseThrow()
+        user.isEmailVerified = true
+        userRepository.save(user)
+        return true
+    }
+
+    private fun generateSecureToken(): String {
+        val bytes = ByteArray(32)
+        java.security.SecureRandom().nextBytes(bytes)
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+}
+```
+
+#### P1: Cache Stratejisi — Multi-Instance Uyarısı
+> **DİKKAT:** Caffeine local cache (§13.3) multi-instance deployment'ta senkronize olmaz.
+> Instance A cache'i invalidate ederse, Instance B eski veriyi 5 dk daha sunar.
+>
+> **Kısa vadeli çözüm:** Cache TTL'leri kısa tutulur (5 dk — kabul edilebilir stale).
+>
+> **Uzun vadeli çözüm:** Entity cache için Redis (`spring-boot-starter-data-redis` + `@Cacheable`)
+> geçişi yapılmalıdır. Redis zaten rate limiting + session için mevcut,
+> entity cache'i de taşımak tutarlı olur.
+
+#### P2: TenantAwareScheduler Paralel İşleme
+```kotlin
+// Mevcut: Seri işleme (tüm tenant'lar for-loop ile)
+// Sorun: 100+ tenant olduğunda job'lar geç tamamlanır
+
+// ÖNERİ: Paralel versiyonu (CompletableFuture ile)
+fun executeForAllTenantsParallel(action: (Tenant) -> Unit) {
+    val tenants = tenantRepository.findAllByIsActiveTrue()
+    val executor = Executors.newFixedThreadPool(
+        minOf(tenants.size, Runtime.getRuntime().availableProcessors() * 2)
+    )
+    val futures = tenants.map { tenant ->
+        CompletableFuture.runAsync({
+            try {
+                TenantContext.setTenantId(tenant.id!!)
+                action(tenant)
+            } catch (e: Exception) {
+                logger.error("[tenant={}] Parallel scheduled task hatası: {}", tenant.slug, e.message, e)
+            } finally {
+                TenantContext.clear()
+            }
+        }, executor)
+    }
+    CompletableFuture.allOf(*futures.toTypedArray()).join()
+    executor.shutdown()
+}
+// NOT: ThreadLocal (TenantContext) her thread'de ayrı set edilir — thread-safe.
+```
+
+#### P4: Index Optimizasyonu
+> **Mevcut:** `idx_appt_conflict` — 6 sütunlu composite index (tenant_id, staff_id, date, start_time, end_time, status)
+>
+> **Sorun:** `status NOT IN (...)` negative condition index'i etkisiz kılabilir.
+>
+> **Öneri:** `(tenant_id, staff_id, date)` 3 sütunlu index + status filtresi uygulamada yapılmalı.
+> MySQL optimizer negative IN condition'da index range scan yerine full scan tercih edebilir.
+>
+> **Ek:** Tüm `@ElementCollection` tabloları için `(parent_id)` index zaten FK ile oluşur
+> ancak multi-tenant sorgularda `(tenant_id, parent_id)` composite index düşünülmeli.
+
+#### D2: Cascade DELETE Uyarısı + Soft Delete Stratejisi
+> **KRİTİK:** Tüm FK'larda `ON DELETE CASCADE` var — tenant silindiğinde TÜM veriler kaybolur.
+>
+> **Yasal risk:** Faturalar Türk Ticaret Kanunu gereği 10 yıl saklanmalıdır.
+>
+> **Öneri:**
+> 1. Tenant silme yerine `is_active = false` (soft deactivation)
+> 2. Fatura/ödeme entityleri fiziksel silme yerine soft delete kullanmalı
+> 3. `TenantAwareEntity`'ye `deleted_at: Instant? = null` eklenmeli:
+
+```kotlin
+// DÜZELTME D2/16-1.3: Soft Delete Stratejisi
+@MappedSuperclass
+abstract class TenantAwareEntity {
+    // ... mevcut alanlar ...
+
+    // Soft delete desteği — fiziksel silme yerine
+    @Column(name = "deleted_at")
+    var deletedAt: Instant? = null
+
+    fun softDelete() { deletedAt = Instant.now() }
+    val isDeleted: Boolean get() = deletedAt != null
+}
+
+// JPA entegrasyonu:
+// @SQLDelete(sql = "UPDATE {tableName} SET deleted_at = NOW() WHERE id = ?")
+// @Where(clause = "deleted_at IS NULL")
+// veya Hibernate @FilterDef ile global soft delete filter
+
+// DİKKAT:
+// - ON DELETE CASCADE olan FK'lar child entity'leri fiziksel siler!
+//   Soft delete ile bu FK'lar ON DELETE RESTRICT'e çevrilmeli.
+// - GDPR silme talebinde deleted_at yerine gerçek anonimizasyon gerekebilir.
+```
+
+#### D3 + D4: Log Retention Stratejisi
+> **notification_logs:** ~300 kayıt/gün → yılda ~110K (çoklanabilir)
+> **audit_logs:** Her CRUD → milyarlarca satır potansiyeli
+>
+> **Retention stratejisi:**
+> 1. **6 aylık aktif veri:** `notification_logs` ve `audit_logs` tablolarında son 6 ay tutulur
+> 2. **Arşivleme:** 6 aydan eski veriler `_archive` tablolarına taşınır (aylık cron job)
+> 3. **Partition önerisi (MySQL 8.0+):**
+>    ```sql
+>    ALTER TABLE audit_logs PARTITION BY RANGE (UNIX_TIMESTAMP(created_at)) (
+>        PARTITION p2025_01 VALUES LESS THAN (UNIX_TIMESTAMP('2025-02-01')),
+>        PARTITION p2025_02 VALUES LESS THAN (UNIX_TIMESTAMP('2025-03-01')),
+>        -- ... aylık partition'lar
+>        PARTITION p_future VALUES LESS THAN MAXVALUE
+>    );
+>    ```
+> 4. **Uzun vadeli:** Elasticsearch veya MongoDB'ye taşıma (loglama-specific DB)
+
+#### O1: CI/CD Artifact Stratejisi
+> **Mevcut durum:** CI'da `./gradlew build` → JAR oluşturur, sonra `docker build` → Dockerfile JAR'ı kopyalar.
+>
+> **Sorun:** Multi-stage Dockerfile kullanılıyorsa CI'daki JAR kullanılmaz (Docker içinde tekrar build olur).
+> Simple Dockerfile kullanılıyorsa CI'dan Docker context'e JAR aktarılmalıdır.
+>
+> **Karar:** Multi-stage Dockerfile tercih edilmeli — CI'da ayrı artifact paylaşımı gerekmez.
+> Docker build kendi içinde Gradle build yapar. CI'daki test aşaması sadece testler + lint için kalır.
+
+#### O3: Certbot İlk Sertifika Oluşturma
+```bash
+# İlk deployment'ta sertifika oluşturma (renewal değil):
+# 1. Nginx'i sadece HTTP ile başlat (SSL config'i yorum satırı):
+docker compose up -d nginx
+
+# 2. Certbot ile ilk sertifikayı al:
+docker compose run --rm certbot certonly \
+    --webroot -w /var/www/certbot \
+    -d app.com -d "*.app.com" \
+    --email admin@app.com \
+    --agree-tos --no-eff-email
+
+# 3. Nginx'i SSL config ile yeniden başlat:
+docker compose restart nginx
+
+# NOT: Wildcard sertifika (*.app.com) için DNS-01 challenge gerekir:
+# docker compose run --rm certbot certonly \
+#     --manual --preferred-challenges dns \
+#     -d "*.app.com" -d app.com
+```
+
+#### O4: Docker Build — JAR Artifact
+> Multi-stage Dockerfile kullanıldığında CI pipeline'da ayrı JAR aktarımı gerekmez.
+> Dockerfile kendi içinde `./gradlew build` çalıştırır. Eğer simple Dockerfile tercih edilirse:
+> ```yaml
+> # GitHub Actions — artifact aktarımı:
+> - uses: actions/upload-artifact@v4
+>   with:
+>     name: app-jar
+>     path: build/libs/*.jar
+> # docker job'unda:
+> - uses: actions/download-artifact@v4
+>   with:
+>     name: app-jar
+>     path: ./build/libs/
+> ```
+
+#### AA-D3: blog_posts Orphan Handling
+> `ON DELETE SET NULL` zaten uygulanmış (satır 3665) — doğru tasarım.
+> Admin panelinde "yazarı silinmiş" blog yazılarını filtreleme önerisi:
+> ```kotlin
+> // BlogRepository:
+> fun findByAuthorIsNull(): List<BlogPost>  // Orphan blog yazıları
+> // Admin panelinde: "Yazarı silinmiş yazılar" filtresi
+> ```
+
+#### AA-O11: appointment_services Tenant Filter Uyumluluk Notu
+> **DİKKAT:** `AppointmentService` (pivot entity) `TenantAwareEntity`'den extend ediyor.
+> `CascadeType.ALL` + `orphanRemoval = true` ile Hibernate Filter uyumluluğu test edilmeli.
+> Cascade işlemleri sırasında tenant filter'ın child entity'lere uygulanıp uygulanmadığı
+> integration test ile doğrulanmalıdır. Olası sorun: parent save → child insert'te
+> tenant_id otomatik set edilmemesi.
+
+#### AA-E9: Swagger/OpenAPI Tenant-Aware Yapılandırma
+```kotlin
+// Multi-tenant ortamda Swagger UI'da X-Tenant-ID header'ı gerekir.
+@Configuration
+class SwaggerConfig {
+    @Bean
+    fun customOpenApi(): OpenAPI = OpenAPI()
+        .info(Info().title("Aesthetic Platform API").version("1.0"))
+        .addSecurityItem(SecurityRequirement().addList("bearer-jwt"))
+        .components(Components()
+            .addSecuritySchemes("bearer-jwt", SecurityScheme()
+                .type(SecurityScheme.Type.HTTP)
+                .scheme("bearer")
+                .bearerFormat("JWT"))
+            .addParameters("X-Tenant-ID", Parameter()
+                .`in`("header")
+                .name("X-Tenant-ID")
+                .description("Tenant subdomain slug (ör: salon1)")
+                .required(false)  // Subdomain'den otomatik çözümlenir, manual test için
+                .schema(StringSchema()))
+        )
+}
+// NOT: Swagger UI üretimde devre dışı bırakılmalı (springdoc.swagger-ui.enabled=false)
+```
+
+#### AA-E10: Kafka / Event-Driven Uzun Vadeli Roadmap
+> **Mevcut:** Tüm iletişim senkron veya `@Async` — mevcut ölçekte yeterli.
+>
+> **Gelecekte gerektiğinde:** Bildirim, audit log, webhook processing gibi işlemler
+> event-driven mimariye (Kafka / RabbitMQ) taşınabilir:
+> - `AppointmentCreatedEvent` → NotificationConsumer (bildirim gönder)
+> - `AuditEvent` → AuditLogConsumer (audit log yaz)
+> - `WebhookReceivedEvent` → PaymentConsumer (ödeme işle)
+>
+> Bu geçiş 50+ tenant veya yüksek throughput gerektiğinde değerlendirilmelidir.
+> Şu an `@Async` + ThreadPoolTaskExecutor yeterlidir.
+
+#### 16-1.1: UUID v7 + BINARY(16) Depolama
+> **Mevcut:** `GenerationType.UUID` = UUID v4 (rastgele) + `VARCHAR(36)` (36 byte + index overhead)
+>
+> **Sorun:** UUID v4 rastgele olduğu için InnoDB Clustered Index'te fragmantasyona neden olur.
+> Yeni kayıtlar rastgele page'lere yazılır → INSERT performansı düşer (büyük veri setlerinde ~%80).
+>
+> **Çözüm:** UUID v7 (zaman damgalı, sıralı) + `BINARY(16)` (16 byte — %56 küçük):
+> ```kotlin
+> // build.gradle.kts:
+> // implementation("com.fasterxml.uuid:java-uuid-generator:5.1.0")
+>
+> // UUIDv7Generator.kt:
+> import com.fasterxml.uuid.Generators
+> class UUIDv7Generator : IdentifierGenerator {
+>     private val generator = Generators.timeBasedEpochGenerator()
+>     override fun generate(session: SharedSessionContractImplementor, obj: Any): Any {
+>         return generator.generate()
+>     }
+> }
+>
+> // Entity'de kullanım:
+> // @Id
+> // @GeneratedValue(generator = "uuid-v7")
+> // @GenericGenerator(name = "uuid-v7", strategy = "com.app.UUIDv7Generator")
+> // @Column(columnDefinition = "BINARY(16)")
+> // val id: UUID? = null
+> ```
+>
+> **Migration stratejisi:** Yeni tablolar UUID v7 + BINARY(16), mevcut tablolar kademeli geçiş.
+> Mevcut VARCHAR(36) UUID'ler `UNHEX(REPLACE(uuid, '-', ''))` ile dönüştürülebilir.
+
+#### 16-1.2: Composite Index İyileştirme
+> Composite indexler mevcut (migration'larda tanımlı).
+>
+> **İyileştirme:** `idx_appt_conflict` index'i optimize edilmeli:
+> - Mevcut: `(tenant_id, staff_id, date, start_time, end_time, status)` — 6 sütun
+> - Önerilen: `(tenant_id, staff_id, date)` — 3 sütun + status filtresi uygulamada
+> - `status NOT IN (...)` negative condition MySQL optimizer'da index'i etkisiz kılabilir
+>
+> **Ek:** `@ElementCollection` tabloları için `(parent_id)` index FK ile oluşur,
+> ancak multi-tenant sorgularda performans için `(tenant_id, parent_id)` composite gerekebilir.
+
+#### 16-2.2: Noisy Neighbor Koruması
+```kotlin
+// DÜZELTME 16-2.2: Tenant-ID bazlı rate limiting (S3 userId bucket ile birleşik)
+// Her paket için farklı API kota limiti:
+enum class PlanRateLimit(val requestsPerMinute: Int) {
+    STARTER(100),
+    PROFESSIONAL(500),
+    BUSINESS(1000),
+    ENTERPRISE(2000)
+}
+
+// RateLimitFilter'a (§7.5) tenant bucket eklenmeli:
+private val tenantBuckets: Cache<String, Bucket> = Caffeine.newBuilder()
+    .maximumSize(5_000)
+    .expireAfterAccess(Duration.ofMinutes(5))
+    .build()
+
+// doFilterInternal() içinde:
+// val tenantId = TenantContext.getTenantId()
+// val tenantBucket = tenantBuckets.get(tenantId) { createTenantBucket(plan.rateLimit) }
+// if (!tenantBucket.tryConsume(1)) → 429 Too Many Requests
+
+// NOT: DB connection pool tenant izolasyonu için HikariCP multi-pool veya
+// pgBouncer tenant routing gelecekte düşünülebilir.
+```
+
+#### 16-3.1: Deadlock / Gap Lock Önleme — Redis Reservation
+> **Mevcut:** `PESSIMISTIC_WRITE` lock + deadlock uyarısı (satır 1500, 1569).
+>
+> **Sorun:** Gap Lock riski hala mevcut — aynı aralığa eşzamanlı iki INSERT deadlock yapabilir.
+>
+> **Çözüm:** Redis tabanlı Reservation (Hold) mekanizması:
+> ```
+> SETNX tenant:{tenantId}:slot:{date}:{time}:{staffId} userId EX 300
+> ```
+> - Slotu 5 dakika geçici kilitle (kullanıcı ödeme/onay yapana kadar)
+> - Süre dolunca otomatik serbest (Redis TTL)
+> - DB'ye yazma sadece reservation sahibi yapabilir
+> - Race condition: Redis SETNX atomic — ilk gelen alır
+>
+> **Akış:** Müşteri slot seçer → Redis SETNX → Başarılı → Form doldurur → DB INSERT → Redis DEL
+>                               → Başarısız → "Slot başka biri tarafından seçildi" mesajı
+
+#### 16-3.2: DST (Yaz Saati) Geçiş Uyarısı
+> **Mevcut:** `ZonedDateTime` zaten kullanılıyor — doğru yaklaşım.
+>
+> **EKSİK DİKKAT:** DST geçişlerinde (Mart/Kasım) randevu saatleri 1 saat kayabilir.
+> Spring `@Scheduled` cron job'ları UTC ile çalışır, tenant timezone'u ile uyumsuzluk olabilir.
+>
+> **Kontrol listesi:**
+> 1. `@Scheduled(cron = ...)` → `zone = "UTC"` parametresi ekle (varsayılan JVM zone'a bağımlılığı kaldır)
+> 2. Randevu oluşturmada `ZonedDateTime.of(date, time, zone)` kullanılıyor — DST geçişinde
+>    "saat 02:30" gibi var olmayan saatler için `ZoneRules.getTransition()` kontrolü ekle
+> 3. Hatırlatma job'larında (24h, 1h) hesaplanan zaman DST geçişi nedeniyle yanlış olabilir —
+>    `Duration.between()` yerine `ChronoUnit.HOURS.between()` kullan
+
+#### 16-3.3: Buffer Time Refinement
+> **Mevcut:** `buffer_minutes` tek alan (Service entity) — hizmetler arası tampon süresi.
+>
+> **İyileştirme önerisi:** İki tip buffer ayrımı:
+> - **Internal Buffer (Hizmetler arası):** Mevcut `bufferMinutes` — randevular arası boşluk
+> - **Post-Service Buffer (Temizlik):** Hizmet sonrası oda/alan temizleme süresi
+>
+> ```kotlin
+> // Service entity'ye ek alan:
+> var postServiceBufferMinutes: Int = 0  // Hizmet sonrası temizlik süresi
+> // Toplam buffer = bufferMinutes + postServiceBufferMinutes
+> // AvailabilityService'te slot hesaplaması buna göre güncellenmeli
+> ```
+
+#### 16-4.1: Sağlık Verisi Şifreleme (AES-256 Encryption at Rest)
+```kotlin
+// DÜZELTME 16-4.1: Hasta notları (appointmentNotes) ve hassas alanlar şifresiz tutuluyor.
+// Sadece SSL/TLS (transport encryption) mevcut — DB'de düz metin.
+
+// EncryptedStringConverter.kt — JPA AttributeConverter
+@Converter
+class EncryptedStringConverter : AttributeConverter<String, String> {
+    // Tenant başına benzersiz encryption key (tenant_encryption_keys tablosu)
+    // Key rotation: Yeni key ile encrypt, eski key ile decrypt fallback
+
+    override fun convertToDatabaseColumn(attribute: String?): String? {
+        if (attribute == null) return null
+        val tenantKey = EncryptionKeyProvider.getKeyForCurrentTenant()
+        return AES256.encrypt(attribute, tenantKey)
+    }
+
+    override fun convertToEntityAttribute(dbData: String?): String? {
+        if (dbData == null) return null
+        val tenantKey = EncryptionKeyProvider.getKeyForCurrentTenant()
+        return AES256.decrypt(dbData, tenantKey)
+    }
+}
+
+// Kullanım (hassas alanlarda):
+// @Convert(converter = EncryptedStringConverter::class)
+// var appointmentNotes: String? = null
+
+// tenant_encryption_keys tablosu:
+// CREATE TABLE tenant_encryption_keys (
+//     tenant_id VARCHAR(36) NOT NULL PRIMARY KEY,
+//     encryption_key VARCHAR(255) NOT NULL,  -- AES-256 key (encrypted with master key)
+//     key_version INT NOT NULL DEFAULT 1,
+//     rotated_at TIMESTAMP(6) NULL,
+//     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+// );
+```
+
+#### 16-4.3: S3 Presigned URLs
+```kotlin
+// DÜZELTME 16-4.3: Public URL'ler yerine ömürlü Presigned URL kullanılmalı.
+// Eski çalışanlara dosya erişimi kapanır, URL paylaşımı ile unauthorized access engellenir.
+
+@Service
+class StorageService(private val s3Client: S3Client) {
+    fun getPresignedUrl(key: String, expirationMinutes: Int = 15): String {
+        val presigner = S3Presigner.builder()
+            .region(Region.EU_CENTRAL_1)
+            .build()
+        val getObjectRequest = GetObjectRequest.builder()
+            .bucket(bucketName)
+            .key(key)
+            .build()
+        val presignRequest = GetObjectPresignRequest.builder()
+            .signatureDuration(Duration.ofMinutes(expirationMinutes.toLong()))
+            .getObjectRequest(getObjectRequest)
+            .build()
+        return presigner.presignGetObject(presignRequest).url().toString()
+    }
+
+    // Upload için de Presigned URL:
+    fun getPresignedUploadUrl(key: String, contentType: String): String {
+        // PutObjectPresignRequest ile benzer şekilde
+        // Frontend doğrudan S3'e upload yapar (backend proxy gerekmez)
+    }
+}
+// NOT: Mevcut public URL'ler kademeli olarak presigned'a geçirilmeli.
+// Image URL'leri API response'larında presigned URL olarak dönülmeli.
+```
+
+#### 16-6.2: Zero-Downtime Migration
+> **Sorun:** Büyük tablolara Flyway ile `ALTER TABLE ADD COLUMN` tabloyu dakikalarca kilitler.
+>
+> **Çözüm:** Online Schema Change araçları:
+> - **gh-ost** (GitHub): Shadow table + binlog replication ile lock-free ALTER
+> - **pt-online-schema-change** (Percona): Trigger-based approach
+>
+> ```bash
+> # gh-ost örneği:
+> gh-ost \
+>     --host=db.app.com --database=aesthetic \
+>     --table=appointments --alter="ADD COLUMN new_field VARCHAR(255)" \
+>     --allow-on-master --execute
+> ```
+>
+> **CI/CD entegrasyonu:**
+> - Flyway migration'dan önce tablo boyutunu kontrol et
+> - 1M+ satırlı tablolarda otomatik gh-ost kullan
+> - Migration safety check: `SHOW TABLE STATUS` ile row count kontrol
+
+#### 8-1: SubscriptionService.checkAndExpireTrial()
+```kotlin
+// DÜZELTME 8-1: Çağrı mevcut (satır 5942) ama metot tanımı eksikti.
+
+@Service
+class SubscriptionService(
+    private val subscriptionRepository: SubscriptionRepository,
+    private val subscriptionModuleRepository: SubscriptionModuleRepository,
+    private val tenantRepository: TenantRepository
+) {
+    companion object {
+        private val logger = LoggerFactory.getLogger(SubscriptionService::class.java)
+    }
+
+    /**
+     * Trial süresi dolan tenant'ları tespit et + abonelik durumunu EXPIRED'a güncelle.
+     * ScheduledJobs.checkExpiredTrials() tarafından her gece 02:00'de çağrılır.
+     */
+    @Transactional
+    fun checkAndExpireTrial(tenantId: String) {
+        val subscription = subscriptionRepository.findByTenantId(tenantId) ?: return
+
+        // Sadece TRIAL plan ve aktif abonelikleri kontrol et
+        if (subscription.plan != SubscriptionPlan.TRIAL) return
+        if (subscription.status != SubscriptionStatus.ACTIVE) return
+
+        // Trial süresi dolmuş mu?
+        if (subscription.endDate.isBefore(LocalDate.now())) {
+            subscription.status = SubscriptionStatus.EXPIRED
+            subscriptionRepository.save(subscription)
+
+            // Tenant'ın aktif modüllerini devre dışı bırak (core hariç)
+            val modules = subscriptionModuleRepository.findBySubscriptionId(subscription.id!!)
+            modules.filter { !it.isCoreModule }.forEach { module ->
+                module.isActive = false
+                subscriptionModuleRepository.save(module)
+            }
+
+            logger.info("[tenant={}] Trial süresi doldu — abonelik EXPIRED olarak güncellendi", tenantId)
+        }
+    }
+}
+```
+
+#### 8-2: PaymentService.processWebhookPayload()
+```kotlin
+// DÜZELTME 8-2: Çağrı mevcut (satır 5340) ama metot tanımı eksikti.
+// PaymentService sınıfına eklenmeli:
+
+/**
+ * iyzico webhook payload'ını işle.
+ * WebhookController.handleIyzicoWebhook() tarafından çağrılır.
+ * Idempotency: processed_webhook_events tablosunda referans kodu kontrol edilir.
+ */
+@Transactional
+fun processWebhookPayload(payload: String) {
+    val json = objectMapper.readTree(payload)
+    val eventType = json.get("eventType")?.asText()
+        ?: throw IllegalArgumentException("eventType alanı bulunamadı")
+    val referenceCode = json.get("token")?.asText()
+        ?: json.get("paymentId")?.asText()
+        ?: throw IllegalArgumentException("Referans kodu bulunamadı")
+
+    // Idempotency check — aynı event tekrar işlenmesin
+    if (processedWebhookEventRepository.existsByEventId(referenceCode)) {
+        logger.info("Webhook event zaten işlenmiş — referenceCode={}", referenceCode)
+        return
+    }
+
+    when (eventType) {
+        "PAYMENT_SUCCESS" -> {
+            val payment = paymentRepository.findByProviderPaymentId(referenceCode)
+                ?: throw ResourceNotFoundException("Ödeme bulunamadı: $referenceCode")
+            payment.status = PaymentStatus.COMPLETED
+            payment.paidAt = Instant.now()
+            paymentRepository.save(payment)
+
+            // Aboneliği aktifleştir
+            val subscription = subscriptionRepository.findById(payment.subscriptionId!!).orElseThrow()
+            subscription.status = SubscriptionStatus.ACTIVE
+            subscriptionRepository.save(subscription)
+        }
+        "PAYMENT_FAILURE" -> {
+            val payment = paymentRepository.findByProviderPaymentId(referenceCode)
+            payment?.let {
+                it.status = PaymentStatus.FAILED
+                paymentRepository.save(it)
+            }
+        }
+        "SUBSCRIPTION_CANCELLED" -> {
+            // İptal işlemi
+            logger.info("Abonelik iptal webhook — referenceCode={}", referenceCode)
+        }
+        else -> logger.warn("Bilinmeyen webhook eventType: {}", eventType)
+    }
+
+    // İşlenen event'i kaydet (idempotency)
+    processedWebhookEventRepository.save(ProcessedWebhookEvent().apply {
+        this.eventId = referenceCode
+        this.provider = "IYZICO"
+        this.eventType = eventType
+    })
+}
 ```
 
 ---
