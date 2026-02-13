@@ -11,6 +11,24 @@ Bu dosya, tüm geliştirme sürecinde uyulması gereken kuralları tanımlar. He
 - **Base package:** `com.aesthetic.backend`
 - **Mimari referans:** `BACKEND_ARCHITECTURE.md`
 
+### Frontend Dokümantasyon Senkronizasyonu (KRİTİK)
+
+Backend'de aşağıdaki değişiklikler yapıldığında `FRONTEND_ARCHITECTURE.md` ve/veya `CLAUDE_FRONTEND.md` de güncellenmelidir:
+
+| Backend Değişikliği | Güncellenecek Frontend Dokümanı | İlgili Bölüm |
+|---------------------|--------------------------------|---------------|
+| Yeni/değişen API endpoint | FRONTEND_ARCHITECTURE.md | §25 Backend ile Entegrasyon Referansı |
+| DTO ekleme/değiştirme (Request/Response) | FRONTEND_ARCHITECTURE.md | §5 API Client + ilgili feature bölümü |
+| Enum ekleme/değiştirme (ErrorCode, Status, vb.) | FRONTEND_ARCHITECTURE.md | §5.2 + §8.1 + ilgili bölüm |
+| Yeni FeatureModule | FRONTEND_ARCHITECTURE.md | §8 Modül Sistemi |
+| SiteSettings alanı ekleme | FRONTEND_ARCHITECTURE.md | §2.4 Tenant Config + §10 Tema |
+| Yeni BusinessType | FRONTEND_ARCHITECTURE.md | §9 Terminoloji + §10 Tema |
+| Appointment status geçiş kuralı değişikliği | FRONTEND_ARCHITECTURE.md | §16 Randevu Sistemi |
+| Yeni güvenlik kuralı / CORS değişikliği | CLAUDE_FRONTEND.md | §8 Auth + §12 Güvenlik |
+| Plan limiti / modül değişikliği | FRONTEND_ARCHITECTURE.md | §28 Ödeme & Abonelik |
+
+*WHY: Frontend ve backend dokümantasyonları birebir senkron olmalıdır. Backend'de eklenen bir endpoint frontend dokümanında eksikse, frontend geliştirici o endpoint'i bilmez ve kullanmaz. Enum uyumsuzluğu runtime hatalarına yol açar.*
+
 ---
 
 ## 2. Paket Yapısı

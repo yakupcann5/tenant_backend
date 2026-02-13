@@ -506,8 +506,7 @@ aesthetic-saas-backend/
 │   │   │   │   ├── JwtTokenProvider.kt                  # Token oluşturma/doğrulama
 │   │   │   │   ├── JwtAuthenticationFilter.kt           # Request filter
 │   │   │   │   ├── CustomUserDetailsService.kt          # UserDetails yükleme
-│   │   │   │   ├── RefreshToken.kt                      # Refresh token entity (revocation)
-│   │   │   │   └── SecurityExpressions.kt               # @PreAuthorize ifadeleri
+│   │   │   │   └── RefreshToken.kt                      # Refresh token entity (revocation)
 │   │   │   │
 │   │   │   ├── domain/                                  # JPA Entity'ler
 │   │   │   │   ├── tenant/
@@ -814,8 +813,11 @@ class User : TenantAwareEntity() {
     @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
 
-    @Column(nullable = false)
-    var name: String = ""
+    @Column(name = "first_name", nullable = false, length = 100)
+    var firstName: String = ""
+
+    @Column(name = "last_name", nullable = false, length = 100)
+    var lastName: String = ""
 
     @Column(nullable = false)
     var email: String = ""
@@ -825,7 +827,8 @@ class User : TenantAwareEntity() {
 
     var phone: String? = null
     var image: String? = null
-    var title: String? = null                        // DÜZELTME AA-E4: Personel unvanı ("Dr.", "Uzm." vb.)
+    @Column(length = 100)
+    var title: String? = null                        // Personel unvanı ("Dr.", "Uzm." vb.)
 
     @Enumerated(EnumType.STRING)
     var role: Role = Role.CLIENT
@@ -934,23 +937,24 @@ class PatientRecord : TenantAwareEntity() {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
 
-    @OneToOne(fetch = FetchType.LAZY, optional = false)
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "client_id", nullable = false)
     lateinit var client: User                  // Hangi müşteriye ait
 
-    // Sektöre göre değişen yapılandırılmış veri (JSON)
-    // Diş hekimi: {"allergies":["Lateks"],"bloodType":"A+","chronicDiseases":[]}
-    // Diyetisyen: {"height":175,"weight":80,"targetWeight":70,"allergies":["Gluten"]}
-    // Fizyoterapist: {"injuryArea":"Sol omuz","painLevel":7,"mobilityScore":4}
-    @Column(columnDefinition = "JSON")
-    var structuredData: String = "{}"
-
-    // Genel metin notları (tüm sektörler)
+    // Yapılandırılmış tıbbi veriler — typed alanlar (JSON yerine)
+    var bloodType: String? = null              // "A+", "B-", "0+" vb.
     @Column(columnDefinition = "TEXT")
-    var generalNotes: String? = null
+    var allergies: String = ""                 // "Lateks, Penisilin"
+    @Column(columnDefinition = "TEXT")
+    var chronicConditions: String = ""         // "Diyabet, Hipertansiyon"
+    @Column(columnDefinition = "TEXT")
+    var currentMedications: String = ""        // "Metformin 500mg"
+    @Column(columnDefinition = "TEXT")
+    var medicalNotes: String = ""              // Genel tıbbi notlar
 
-    @OneToMany(mappedBy = "patientRecord", fetch = FetchType.LAZY, cascade = [CascadeType.ALL])
-    val treatments: MutableList<TreatmentHistory> = mutableListOf()
+    // Sektöre özgü ek veri (JSON) — typed alanlara sığmayan ekstralar
+    @Column(columnDefinition = "JSON")
+    var extraData: String? = null              // {"height":175,"weight":80,"targetWeight":70}
 
     @CreationTimestamp val createdAt: Instant? = null
     @UpdateTimestamp var updatedAt: Instant? = null
@@ -969,12 +973,8 @@ class TreatmentHistory : TenantAwareEntity() {
     val id: String? = null
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "patient_record_id", nullable = false)
-    lateinit var patientRecord: PatientRecord
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "appointment_id")
-    var appointment: Appointment? = null          // İlişkili randevu (opsiyonel)
+    @JoinColumn(name = "client_id", nullable = false)
+    lateinit var client: User                     // Hangi müşteriye ait
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "performed_by")
@@ -984,18 +984,13 @@ class TreatmentHistory : TenantAwareEntity() {
     var title: String = ""                        // "Dolgu uygulaması", "Diyet planı güncelleme"
 
     @Column(columnDefinition = "TEXT")
-    var description: String? = null               // Detaylı açıklama
+    var description: String = ""                  // Detaylı açıklama
 
-    // Tedaviye özgü yapılandırılmış veri (JSON)
-    // Diş: {"toothNumber":14,"procedure":"Dolgu","material":"Kompozit"}
-    // Diyetisyen: {"weight":78,"bmi":25.5,"dietPlan":"1500kcal","measurements":{"waist":85}}
-    // Fizyoterapist: {"exercises":["Omuz rotasyonu","Band çekme"],"sets":3,"reps":12}
-    @Column(columnDefinition = "JSON")
-    var treatmentData: String = "{}"
+    @Column(columnDefinition = "TEXT")
+    var notes: String = ""                        // Ek notlar
 
-    // Dosya ekleri (röntgen, diyet listesi PDF, egzersiz videosu vb.)
-    @Column(columnDefinition = "JSON")
-    var attachments: String = "[]"                // [{"fileName":"rontgen.jpg","path":"...","type":"image/jpeg"}]
+    var beforeImage: String? = null               // Tedavi öncesi fotoğraf URL
+    var afterImage: String? = null                // Tedavi sonrası fotoğraf URL
 
     @CreationTimestamp val createdAt: Instant? = null
 }
@@ -1010,8 +1005,8 @@ interface PatientRecordRepository : JpaRepository<PatientRecord, String> {
 }
 
 interface TreatmentHistoryRepository : JpaRepository<TreatmentHistory, String> {
-    fun findByPatientRecordIdOrderByTreatmentDateDesc(
-        patientRecordId: String, pageable: Pageable
+    fun findAllByClientIdAndTenantId(
+        clientId: String, tenantId: String, pageable: Pageable
     ): Page<TreatmentHistory>
 }
 ```
@@ -1332,9 +1327,8 @@ class Product : TenantAwareEntity() {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
     var slug: String = ""
-    var name: String = ""
-    var brand: String = ""
-    var category: String = ""
+    var title: String = ""
+    var shortDescription: String = ""
     @Column(columnDefinition = "TEXT") var description: String = ""
     @Column(precision = 10, scale = 2) var price: BigDecimal = BigDecimal.ZERO
     var currency: String = "TRY"
@@ -1342,16 +1336,16 @@ class Product : TenantAwareEntity() {
     @ElementCollection
     @CollectionTable(name = "product_features", joinColumns = [JoinColumn(name = "product_id")])
     @Column(name = "feature")
-    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması
+    @OrderColumn(name = "sort_order")
     var features: MutableList<String> = mutableListOf()
     var stockQuantity: Int? = null          // null = stok takibi yok
-    var lowStockThreshold: Int = 5          // Stok uyarı eşiği
     var isActive: Boolean = true
     var sortOrder: Int = 0
-    var metaTitle: String? = null
-    var metaDescription: String? = null
-    @CreationTimestamp val createdAt: Instant? = null   // DÜZELTME: LocalDateTime → Instant (UTC)
-    @UpdateTimestamp var updatedAt: Instant? = null     // DÜZELTME: LocalDateTime → Instant (UTC)
+    var seoTitle: String? = null
+    var seoDescription: String? = null
+    var ogImage: String? = null
+    @CreationTimestamp val createdAt: Instant? = null
+    @UpdateTimestamp var updatedAt: Instant? = null
 }
 
 // BlogPost.kt
@@ -1367,28 +1361,30 @@ class BlogPost : TenantAwareEntity() {
     val id: String? = null
     var slug: String = ""
     var title: String = ""
-    @Column(columnDefinition = "TEXT") var excerpt: String = ""
+    @Column(columnDefinition = "TEXT") var summary: String = ""
     @Column(columnDefinition = "LONGTEXT") var content: String = ""
+    var coverImage: String? = null
 
-    // Yazar artık User entity'sine bağlı (string değil)
+    // Yazar: User entity referansı + snapshot (authorName)
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "author_id")
     var author: User? = null
+    var authorName: String = ""            // Snapshot — yazar adı değişse bile korunur
 
-    var category: String = ""
-    var image: String? = null
     @ElementCollection
     @CollectionTable(name = "blog_post_tags", joinColumns = [JoinColumn(name = "blog_post_id")])
     @Column(name = "tag")
-    @OrderColumn(name = "sort_order")    // DÜZELTME D1: Sıralama korunması
+    @OrderColumn(name = "sort_order")
     var tags: MutableList<String> = mutableListOf()
-    var readTime: String = ""
+    // readTime: DB'de saklanmaz, BlogPostMapper.toResponse() içinde runtime'da hesaplanır
+    // (kelime sayısı / 200 WPM → "$minutes dk okuma")
     var isPublished: Boolean = false
-    var publishedAt: Instant? = null               // DÜZELTME: LocalDateTime → Instant (UTC)
-    var metaTitle: String? = null
-    var metaDescription: String? = null
-    @CreationTimestamp val createdAt: Instant? = null   // DÜZELTME: LocalDateTime → Instant (UTC)
-    @UpdateTimestamp var updatedAt: Instant? = null     // DÜZELTME: LocalDateTime → Instant (UTC)
+    var publishedAt: Instant? = null
+    var seoTitle: String? = null
+    var seoDescription: String? = null
+    var ogImage: String? = null
+    @CreationTimestamp val createdAt: Instant? = null
+    @UpdateTimestamp var updatedAt: Instant? = null
 }
 
 // GalleryItem.kt
@@ -1397,18 +1393,21 @@ class BlogPost : TenantAwareEntity() {
 class GalleryItem : TenantAwareEntity() {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     val id: String? = null
+    var title: String = ""
+    var description: String = ""
+    var imageUrl: String = ""                     // Ana görsel URL
+    var beforeImageUrl: String? = null            // Öncesi fotoğrafı (opsiyonel)
+    var afterImageUrl: String? = null             // Sonrası fotoğrafı (opsiyonel)
+    var isActive: Boolean = true
+    var sortOrder: Int = 0
     var category: String = ""
 
-    // Service ilişkisi artık entity referansı (string değil)
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "service_id")
-    var service: Service? = null
+    var service: Service? = null                  // İlişkili hizmet (opsiyonel)
 
-    var beforeImage: String = ""
-    var afterImage: String = ""
-    var description: String = ""
-    var isActive: Boolean = true
-    @CreationTimestamp val createdAt: Instant? = null   // DÜZELTME: LocalDateTime → Instant (UTC)
+    @CreationTimestamp val createdAt: Instant? = null
+    @UpdateTimestamp var updatedAt: Instant? = null
 }
 
 // ContactMessage.kt
@@ -1419,12 +1418,13 @@ class ContactMessage : TenantAwareEntity() {
     val id: String? = null
     var name: String = ""
     var email: String = ""
-    var phone: String? = null
+    var phone: String = ""
     var subject: String = ""
     @Column(columnDefinition = "TEXT") var message: String = ""
     var isRead: Boolean = false
-    var repliedAt: Instant? = null                 // DÜZELTME: LocalDateTime → Instant (UTC)
-    @CreationTimestamp val createdAt: Instant? = null   // DÜZELTME: LocalDateTime → Instant (UTC)
+    var readAt: Instant? = null                    // Okunma zamanı
+    @CreationTimestamp val createdAt: Instant? = null
+    @UpdateTimestamp var updatedAt: Instant? = null
 }
 
 // SiteSettings.kt — workingHoursJson KALDIRILDI (WorkingHours entity'si kullanılıyor)
@@ -1471,27 +1471,32 @@ class Review : TenantAwareEntity() {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "appointment_id")
-    var appointment: Appointment? = null      // Hangi randevu sonrası
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "client_id", nullable = false)
-    var client: User? = null
+    var appointment: Appointment? = null      // Hangi randevu sonrası (opsiyonel)
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "service_id")
-    var service: Service? = null
+    var service: Service? = null              // Hangi hizmet için (opsiyonel)
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "staff_id")
-    var staff: User? = null
+    @JoinColumn(name = "client_id")
+    var client: User? = null
+
+    var clientName: String = ""               // Snapshot — müşteri adı değişse bile korunur
 
     @Column(nullable = false)
-    var rating: Int = 0                        // 1-5 yıldız (0 = henüz değerlendirilmedi)
+    var rating: Int = 0                        // 1-5 yıldız
     @Column(columnDefinition = "TEXT")
-    var comment: String? = null
-    var isApproved: Boolean = false             // Admin onayı gerekli
-    var isPublic: Boolean = true               // Herkese açık mı
-    @CreationTimestamp val createdAt: Instant? = null   // DÜZELTME: LocalDateTime → Instant (UTC)
+    var comment: String = ""
+
+    @Enumerated(EnumType.STRING)
+    var approvalStatus: ReviewApprovalStatus = ReviewApprovalStatus.PENDING  // PENDING, APPROVED, REJECTED
+
+    @Column(columnDefinition = "TEXT")
+    var adminResponse: String? = null          // Admin yanıtı
+    var adminResponseAt: Instant? = null       // Admin yanıt zamanı
+
+    @CreationTimestamp val createdAt: Instant? = null
+    @UpdateTimestamp var updatedAt: Instant? = null
 }
 ```
 

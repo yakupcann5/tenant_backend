@@ -1,0 +1,23 @@
+CREATE TABLE site_settings (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    site_name VARCHAR(255) DEFAULT '',
+    phone VARCHAR(20) DEFAULT '',
+    email VARCHAR(255) DEFAULT '',
+    address TEXT DEFAULT (''),
+    whatsapp VARCHAR(20) DEFAULT '',
+    instagram VARCHAR(255) DEFAULT '',
+    facebook VARCHAR(255) DEFAULT '',
+    twitter VARCHAR(255) DEFAULT '',
+    youtube VARCHAR(255) DEFAULT '',
+    map_embed_url VARCHAR(1000) DEFAULT '',
+    timezone VARCHAR(50) NOT NULL DEFAULT 'Europe/Istanbul',
+    locale VARCHAR(10) NOT NULL DEFAULT 'tr',
+    cancellation_policy_hours INT NOT NULL DEFAULT 24,
+    default_slot_duration_minutes INT NOT NULL DEFAULT 30,
+    theme_settings JSON DEFAULT ('{}'),
+    created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT uk_site_settings_tenant UNIQUE (tenant_id),
+    CONSTRAINT fk_site_settings_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_turkish_ci;

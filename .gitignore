@@ -43,3 +43,9 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Environment ###
+.env
+
+### Uploads ###
+uploads/
